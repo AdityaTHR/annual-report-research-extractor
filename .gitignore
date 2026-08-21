@@ -1,6 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-output/
 *.zip
+output/
 .DS_Store
