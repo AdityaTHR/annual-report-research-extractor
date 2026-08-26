@@ -16,33 +16,22 @@ PRESETS = {
     "Chairman Message": {
         "aliases": [
             "message from the chairman", "chairman's message", "chairperson's message",
-            "message from the chairperson", "letter from the chairman",
+            "message from the chairperson", "letter from the chairman", "chairman's letter",
             "chairman's statement", "chairman statement", "statement from the chairman",
-        ],
-        "end": [
-            "message from the managing director", "managing director's message",
-            "message from the ceo", "ceo message", "our leadership",
-            "board of directors", "team of executives", "contents", "index",
-            "about the company", "about adani enterprises", "company overview", "company profile",
+            "executive chairman's message", "message from the executive chairman",
         ],
     },
     "CEO Message": {
-        "aliases": ["message from the ceo", "ceo message", "ceo's message", "letter from the ceo"],
-        "end": [
-            "message from the managing director", "managing director's message",
-            "our leadership", "board of directors", "team of executives", "contents", "index",
-            "about the company", "company overview", "company profile", "business portfolio",
+        "aliases": [
+            "message from the ceo", "ceo message", "ceo's message", "letter from the ceo",
+            "chief executive officer's message", "message from the chief executive officer",
+            "letter from the chief executive officer",
         ],
     },
     "Managing Director Message": {
         "aliases": [
             "message from the managing director", "managing director's message",
             "md message", "letter from the managing director",
-        ],
-        "end": [
-            "key performance indicators", "our growth engines", "about adani enterprises",
-            "about the company", "company overview", "company profile", "business portfolio",
-            "board of directors", "contents", "index",
         ],
     },
     "Management Discussion & Analysis": {
@@ -51,15 +40,7 @@ PRESETS = {
             "management discussion and analysis report",
             "management discussion & analysis",
             "management discussion and analysis",
-            "md&a",
-        ],
-        "end": [
-            "annexures i to vi to the directors' report",
-            "annexures i to vi to the directors’ report",
-            "annexure i to vi to the director's report",
-            "annexures to the directors' report",
-            "annexures to the directors’ report",
-            "corporate governance report", "corporate governance",
+            "management discussion analysis", "md&a",
         ],
     },
     "Business Responsibility & Sustainability Report (BRSR)": {
@@ -67,33 +48,18 @@ PRESETS = {
             "business responsibility & sustainability report",
             "business responsibility and sustainability report", "brsr report", "brsr",
         ],
-        "end": [
-            "standalone financial statements", "independent auditor's report",
-            "independent auditors' report", "report on the audit of the standalone",
-        ],
     },
     "Business Responsibility Report (BRR)": {
         "aliases": ["business responsibility report", "business responsibility (br) report", "brr report"],
-        "end": [
-            "standalone financial statements", "independent auditor's report",
-            "independent auditors' report", "report on the audit of the standalone",
-        ],
     },
     "ESG Report": {
-        "aliases": ["esg report", "environmental social and governance report"],
-        "end": [
-            "standalone financial statements", "independent auditor's report",
-            "independent auditors' report", "report on the audit of the standalone",
-        ],
+        "aliases": ["esg report", "environmental social and governance report", "environment social and governance report"],
     },
     "Sustainability Report": {
         "aliases": ["sustainability report"],
-        "end": [
-            "standalone financial statements", "independent auditor's report",
-            "independent auditors' report", "report on the audit of the standalone",
-        ],
     },
 }
+
 
 FORMAT_EXT = {"TXT": "txt", "JSON": "json", "PDF": "pdf", "DOCX": "docx", "CSV": "csv", "MD": "md"}
 
@@ -112,33 +78,99 @@ def _ocr(page):
     return pytesseract.image_to_string(img, config="--psm 6")
 
 
+def _layout_lines(page):
+    """Return PyMuPDF lines in native reading order with geometry/font metadata."""
+    out = []
+    try:
+        d = page.get_text("dict")
+        order = 0
+        for block in d.get("blocks", []):
+            for line in block.get("lines", []):
+                spans = [s for s in line.get("spans", []) if s.get("text", "").strip()]
+                if not spans:
+                    continue
+                text = "".join(s.get("text", "") for s in spans).strip()
+                if not text:
+                    continue
+                x0 = min(s["bbox"][0] for s in spans)
+                y0 = min(s["bbox"][1] for s in spans)
+                x1 = max(s["bbox"][2] for s in spans)
+                y1 = max(s["bbox"][3] for s in spans)
+                out.append({
+                    "order": order,
+                    "text": text,
+                    "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                    "size": float(max(s.get("size", 0) for s in spans)),
+                })
+                order += 1
+    except Exception:
+        return []
+    return out
+
+
 def extract_source(name, data):
     ext = name.rsplit(".", 1)[-1].lower()
     if ext == "pdf":
         doc = fitz.open(stream=data, filetype="pdf")
         pages = []
+        structural_tokens = (
+            "content", "chairman", "chief executive", "ceo", "managing director",
+            "management discussion", "corporate governance", "responsibility",
+            "sustainability", "directors' report", "directors’ report", "board's report",
+            "boards’ report", "annexure", "financial statements", "clinical governance",
+            "corporate social responsibility", "notice", "awards", "company overview",
+            "about tcs", "about adani", "performance highlights", "corporate review",
+        )
         for i, page in enumerate(doc):
             text = page.get_text("text")
             method = "native"
+            low = text.lower()
+            # Native geometry is only needed on pages that could contain a structural
+            # heading or on the opening pages where Contents/Index lives. This keeps
+            # large 500-700 page annual reports fast.
+            need_layout = i < 30 or any(tok in low for tok in structural_tokens)
+            lines = _layout_lines(page) if need_layout else [
+                {"order": j, "text": t, "bbox": None, "size": None}
+                for j, t in enumerate(text.splitlines()) if t.strip()
+            ]
             if len(text.strip()) < 40:
                 text = _ocr(page)
                 method = "ocr"
-            pages.append({"page": i + 1, "text": text, "method": method})
+                lines = [
+                    {"order": j, "text": t, "bbox": None, "size": None}
+                    for j, t in enumerate(text.splitlines()) if t.strip()
+                ]
+            pages.append({
+                "page": i + 1,
+                "text": text,
+                "method": method,
+                "width": float(page.rect.width),
+                "height": float(page.rect.height),
+                "lines": lines,
+            })
         return pages
 
     if ext in ("txt", "md"):
         text = data.decode("utf-8", errors="ignore")
         parts = re.split(r"(?m)^\s*=====\s*PAGE\s+(\d+)\s*=====\s*$", text)
         if len(parts) > 2:
-            return [
-                {"page": int(parts[i]), "text": parts[i + 1], "method": "text"}
-                for i in range(1, len(parts), 2)
-            ]
-        return [{"page": None, "text": text, "method": "text"}]
+            result = []
+            for i in range(1, len(parts), 2):
+                body = parts[i + 1]
+                lines = [
+                    {"order": j, "text": t, "bbox": None, "size": None}
+                    for j, t in enumerate(body.splitlines()) if t.strip()
+                ]
+                result.append({"page": int(parts[i]), "text": body, "method": "text", "lines": lines})
+            return result
+        lines = [{"order": j, "text": t, "bbox": None, "size": None} for j, t in enumerate(text.splitlines()) if t.strip()]
+        return [{"page": None, "text": text, "method": "text", "lines": lines}]
 
     if ext == "docx":
         doc = Document(io.BytesIO(data))
-        return [{"page": None, "text": "\n".join(p.text for p in doc.paragraphs), "method": "docx"}]
+        text = "\n".join(p.text for p in doc.paragraphs)
+        lines = [{"order": j, "text": t, "bbox": None, "size": None} for j, t in enumerate(text.splitlines()) if t.strip()]
+        return [{"page": None, "text": text, "method": "docx", "lines": lines}]
 
     raise ValueError(f"Unsupported file type: {ext}")
 
@@ -185,424 +217,607 @@ def clean_pages(pages):
 
 
 COMMON_SECTION_HEADINGS = [
+    "chairman's message", "chairman's letter", "letter from the chairman",
+    "letter from the ceo", "managing director's message",
     "directors' report", "board's report",
     "management discussion and analysis", "management discussion & analysis",
-    "annexures", "corporate governance report",
-    "business responsibility report", "business responsibility & sustainability report",
+    "corporate governance report", "corporate social responsibility",
+    "business responsibility report", "business responsibility and sustainability report",
     "standalone financial statements", "consolidated financial statements",
-    "independent auditor's report", "notice", "gri index",
+    "independent auditor's report", "clinical governance", "notice", "gri content index",
 ]
-
 COMMON_SECTION_COMPACTS = [_compact(h) for h in COMMON_SECTION_HEADINGS]
 
-def _toc_like_page(text):
+# Boundaries are document structure, not requested outputs. Keeping this list compact is
+# deliberate: it covers recurring annual-report sections while Annexure boundaries are
+# discovered generically below.
+BOUNDARY_SPECS = [
+    ("Chairman Message", PRESETS["Chairman Message"]["aliases"]),
+    ("CEO Message", PRESETS["CEO Message"]["aliases"]),
+    ("Managing Director Message", PRESETS["Managing Director Message"]["aliases"]),
+    ("Board's Report", ["board's report", "boards' report", "boards’ report"]),
+    ("Directors' Report", ["directors' report", "directors’ report", "director's report", "directors' report to the shareholders", "directors’ report to the shareholders"]),
+    ("Management Discussion & Analysis", PRESETS["Management Discussion & Analysis"]["aliases"]),
+    ("Corporate Governance Report", ["corporate governance report", "report on corporate governance"]),
+    ("Corporate Social Responsibility", ["corporate social responsibility", "corporate social responsibility report", "csr report"]),
+    ("BRSR", PRESETS["Business Responsibility & Sustainability Report (BRSR)"]["aliases"]),
+    ("BRR", PRESETS["Business Responsibility Report (BRR)"]["aliases"]),
+    ("ESG Report", PRESETS["ESG Report"]["aliases"]),
+    ("Sustainability Report", PRESETS["Sustainability Report"]["aliases"]),
+    ("Clinical Governance", ["clinical governance"]),
+    ("Standalone Financial Statements", ["standalone financial statements", "standalone financials"]),
+    ("Consolidated Financial Statements", ["consolidated financial statements", "consolidated financials"]),
+    ("Independent Auditor's Report", ["independent auditor's report", "independent auditors' report", "independent auditor’s report", "independent auditors’ report", "report on the audit of the standalone financial statements"]),
+    ("Notice", ["notice", "notice of annual general meeting"]),
+    ("GRI Index", ["gri index", "gri content index"]),
+    # Front-matter boundaries keep leadership letters from swallowing later narrative pages.
+    ("About Company", ["about the company", "about tcs", "about adani enterprises limited", "company overview", "company profile"]),
+    ("Board of Directors", ["board of directors"]),
+    ("Management Team", ["management team"]),
+    ("The Year Gone By", ["the year gone by"]),
+    ("Performance Highlights", ["performance highlights", "financial & operational highlights", "financial and operational highlights"]),
+    ("Corporate Review", ["corporate review"]),
+    ("Awards", ["awards", "awards and accolades"]),
+]
+
+_SECTION_MAP_CACHE = {}
+_TOC_CACHE = {}
+
+
+def _doc_key(pages):
+    if not pages:
+        return (0,)
+    first = pages[0].get("text", "")[:700]
+    middle = pages[len(pages) // 2].get("text", "")[:400]
+    last = pages[-1].get("text", "")[-700:]
+    return (len(pages), hash(first), hash(middle), hash(last))
+
+
+def _page_lines(page):
+    lines = page.get("lines") or []
+    if lines:
+        return lines
+    return [
+        {"order": i, "text": t, "bbox": None, "size": None}
+        for i, t in enumerate(page.get("text", "").splitlines()) if _norm_line(t)
+    ]
+
+
+def _toc_like_page(page):
+    text = page.get("text", "")
     low = text.lower()
-    if "contents" in low:
+    if re.search(r"(?im)^\s*contents?\s*$", text) or "co n te n ts" in low:
         return True
     compact_text = _compact(text)
     hits = sum(h in compact_text for h in COMMON_SECTION_COMPACTS)
     return hits >= 5
 
-def _heading_variants(heading):
-    if isinstance(heading, (list, tuple, set)):
-        raw = list(heading)
-    else:
-        raw = [heading]
 
-    out = []
+def _heading_variants(heading):
+    raw = list(heading) if isinstance(heading, (list, tuple, set)) else [heading]
+    out, seen = [], set()
     for h in raw:
         if not h:
             continue
-        h = _norm_line(str(h))
-        variants = [h]
-        variants.append(re.sub(r"\s*\([^)]*\)\s*", " ", h).strip())
+        h = _norm_line(str(h)).replace("’", "'")
+        variants = [h, re.sub(r"\s*\([^)]*\)\s*", " ", h).strip()]
         if "&" in h:
             variants.append(h.replace("&", "and"))
         if re.search(r"\band\b", h, re.I):
             variants.append(re.sub(r"\band\b", "&", h, flags=re.I))
-        if re.search(r"\breport\b$", h, re.I):
-            variants.append(re.sub(r"\breport\b$", "", h, flags=re.I).strip())
-        out.extend(v for v in variants if v)
-
-    # Preserve order, remove duplicate compact forms.
-    seen = set()
-    unique = []
-    for h in out:
-        c = _compact(h)
-        if c and c not in seen:
-            seen.add(c)
-            unique.append(h)
-    return unique
+        for v in variants:
+            c = _compact(v)
+            if c and c not in seen:
+                seen.add(c)
+                out.append(v)
+    return out
 
 
-def _toc_printed_page(pages, heading):
-    """Read a printed report page number from a Contents/Index page.
+def _window_candidates(page, aliases, max_width=4):
+    """Find heading-like alias windows in native PDF reading order."""
+    aliases = _heading_variants(aliases)
+    ac = [(_compact(a), a) for a in aliases]
+    lines = _page_lines(page)
+    if not lines:
+        return []
 
-    Supports both common layouts:
-      Management Discussion and Analysis Report .... 17
-      17 .... Management Discussion and Analysis Report
-    """
-    variants = _heading_variants(heading)
+    sizes = [l.get("size") for l in lines if isinstance(l.get("size"), (int, float)) and 5 <= l.get("size") <= 15]
+    body = sorted(sizes)[len(sizes) // 2] if sizes else 9.0
+    height = float(page.get("height") or 800.0)
+    out = []
 
-    for p in pages[:25]:
-        text = p["text"]
-        low = text.lower()
-        if "contents" not in low and "\nindex\n" not in f"\n{low}\n" and " index " not in f" {low} ":
+    for i in range(len(lines)):
+        for width in range(1, min(max_width, len(lines) - i) + 1):
+            group = lines[i:i + width]
+            text = " ".join(_norm_line(x.get("text", "")) for x in group).strip()
+            wc = _compact(text)
+            if not wc:
+                continue
+            for target, alias in ac:
+                if not target:
+                    continue
+                exact = wc == target
+                contained = target in wc and len(wc) <= len(target) + 30
+                # Allow a short Annexure prefix/suffix around a genuine section title.
+                annexure_contained = target in wc and "annexure" in wc and len(wc) <= len(target) + 45
+                if not (exact or contained or annexure_contained):
+                    continue
+
+                score = 48 if exact else 42
+                if annexure_contained:
+                    score += 8
+
+                max_size = max((x.get("size") or 0) for x in group)
+                delta = max_size - body
+                if max_size >= 16:
+                    score += 18
+                elif delta >= 3:
+                    score += 14
+                elif delta >= 1.5:
+                    score += 8
+
+                bboxes = [x.get("bbox") for x in group if x.get("bbox")]
+                if bboxes:
+                    x0 = min(b[0] for b in bboxes); y0 = min(b[1] for b in bboxes)
+                    x1 = max(b[2] for b in bboxes); y1 = max(b[3] for b in bboxes)
+                    if y0 / max(height, 1) < 0.18:
+                        score += 8
+                    elif y0 / max(height, 1) < 0.35:
+                        score += 4
+                    bbox = [x0, y0, x1, y1]
+                else:
+                    bbox = None
+                    if i < 12:
+                        score += 5
+
+                letters = re.sub(r"[^A-Za-z]+", "", text)
+                if letters and text.upper() == text and len(letters) >= 8:
+                    score += 3
+
+                out.append({
+                    "score": score,
+                    "line_order": group[0].get("order", i),
+                    "line_end": group[-1].get("order", i + width - 1),
+                    "bbox": bbox,
+                    "matched_alias": alias,
+                    "matched_text": text,
+                })
+    # De-duplicate equivalent windows.
+    best = {}
+    for c in out:
+        k = (c["line_order"], c["matched_alias"])
+        if k not in best or c["score"] > best[k]["score"]:
+            best[k] = c
+    return list(best.values())
+
+
+def _edge_folios(page):
+    """Likely printed report folios with x/y position; supports two-page spreads."""
+    width = float(page.get("width") or 600.0)
+    height = float(page.get("height") or 800.0)
+    out = []
+    for line in _page_lines(page):
+        text = _norm_line(line.get("text", ""))
+        bb = line.get("bbox")
+        if not bb:
             continue
+        x0, y0, x1, y1 = bb
+        strict_edge = y0 < 0.06 * height or y1 > 0.94 * height
+        header_footer = y0 < 0.12 * height or y1 > 0.90 * height
+        if not header_footer:
+            continue
+        nums = []
+        m = re.fullmatch(r"0*(\d{1,4})", text)
+        if m and strict_edge:
+            nums = [int(m.group(1))]
+        elif len(text) <= 150 and header_footer:
+            m = re.search(r"(?:\bI\s+|\|\s*|\s)0*(\d{1,4})\s*$", text)
+            if m:
+                nums = [int(m.group(1))]
+        for n in nums:
+            if 0 <= n <= 1500 and not (1900 <= n <= 2099):
+                out.append({"number": n, "x": (x0 + x1) / 2, "y": (y0 + y1) / 2})
+    return out
 
-        flat = re.sub(r"\s+", " ", text.replace("…", "."))
-        for variant in variants:
-            words = re.findall(r"[A-Za-z0-9]+", variant)
-            if not words:
+
+def _explicit_toc_page(page):
+    text = page.get("text", "")
+    low = re.sub(r"\s+", " ", text.lower())
+    return bool(
+        re.search(r"(?im)^\s*contents?\s*$", text)
+        or "co n te n ts" in low
+        or re.search(r"(?im)^\s*index\s*$", text)
+    )
+
+
+def _toc_printed_page(pages, aliases):
+    key = (_doc_key(pages), tuple(_compact(x) for x in _heading_variants(aliases)))
+    if key in _TOC_CACHE:
+        return _TOC_CACHE[key]
+
+    targets = [_compact(x) for x in _heading_variants(aliases)]
+    answer = None
+    for page in pages[:30]:
+        if not _explicit_toc_page(page):
+            continue
+        lines = _page_lines(page)
+        for i, line in enumerate(lines):
+            text = _norm_line(line.get("text", "")).replace("’", "'")
+            c = _compact(text)
+            matched = None
+            for target in targets:
+                if target and (target in c) and len(c) <= len(target) + 40:
+                    matched = target
+                    break
+            if not matched:
                 continue
 
-            # Allow OCR/layout punctuation between heading words.
-            phrase = r"[\s&'’()./\-–—:]*".join(re.escape(w) for w in words)
-            sep = r"[\s.\-–—:·•]*"
+            # Same-line number: "267 Directors' Report" or "Chairman's Message 2".
+            nums = [int(x) for x in re.findall(r"\b(\d{1,4})\b", text) if not (1900 <= int(x) <= 2099)]
+            if nums:
+                # Prefer a number at either edge of the entry.
+                m1 = re.match(r"^\s*0*(\d{1,4})\b", text)
+                m2 = re.search(r"\b0*(\d{1,4})\s*$", text)
+                if m1 and not (1900 <= int(m1.group(1)) <= 2099):
+                    answer = int(m1.group(1)); break
+                if m2 and not (1900 <= int(m2.group(1)) <= 2099):
+                    answer = int(m2.group(1)); break
 
-            # Heading first, page number after it (the common annual-report TOC form).
-            m = re.search(rf"{phrase}{sep}\b(0*\d{{1,4}})\b", flat, re.I)
-            if m:
-                return int(m.group(1))
+            bb = line.get("bbox")
+            if bb:
+                yc = (bb[1] + bb[3]) / 2
+                numeric = []
+                for nline in lines:
+                    nt = _norm_line(nline.get("text", ""))
+                    nb = nline.get("bbox")
+                    mm = re.fullmatch(r"0*(\d{1,4})", nt)
+                    if not (mm and nb):
+                        continue
+                    num = int(mm.group(1))
+                    if 1900 <= num <= 2099:
+                        continue
+                    ny = (nb[1] + nb[3]) / 2
+                    dist = abs(ny - yc)
+                    if dist <= 18:
+                        numeric.append((dist, num))
+                if numeric:
+                    answer = min(numeric)[1]
+                    break
+        if answer is not None:
+            break
 
-    return None
-
-
-def _edge_printed_page_numbers(text):
-    """Return likely printed page numbers from page header/footer text only."""
-    lines = [_norm_line(x) for x in text.splitlines() if _norm_line(x)]
-    edge = lines[:24] + lines[-24:]
-    nums = set()
-
-    for line in edge:
-        # Clean standalone printed page number: 17, 02, etc.
-        m = re.fullmatch(r"0*(\d{1,4})", line)
-        if m:
-            nums.add(int(m.group(1)))
-            continue
-
-        # Footer/header forms such as:
-        # "123rd Annual Report & Accounts 2019-20 03"
-        # "03 Century Textiles and Industries Limited"
-        if len(line) <= 140 and (
-            "annual report" in line.lower()
-            or "century textiles" in line.lower()
-            or "company overview" in line.lower()
-            or "statutory reports" in line.lower()
-            or "financial statements" in line.lower()
-        ):
-            m = re.match(r"^0*(\d{1,4})\b", line)
-            if m:
-                nums.add(int(m.group(1)))
-            m = re.search(r"\b0*(\d{1,4})$", line)
-            if m:
-                nums.add(int(m.group(1)))
-    return nums
+    if len(_TOC_CACHE) > 200:
+        _TOC_CACHE.clear()
+    _TOC_CACHE[key] = answer
+    return answer
 
 
-def _contains_printed_page_number(text, number):
-    if number is None:
-        return False
-    return int(number) in _edge_printed_page_numbers(text)
-
-
-def _physical_index_for_printed_page(pages, printed_page, start_after=-1):
-    if printed_page is None:
+def _anchor_printed_page(page, anchor, toc_page=None):
+    if toc_page is not None:
+        return toc_page
+    folios = _edge_folios(page)
+    if not folios:
         return None
-    for i in range(start_after + 1, len(pages)):
-        if _toc_like_page(pages[i]["text"]):
-            continue
-        if _contains_printed_page_number(pages[i]["text"], printed_page):
-            return i
-    return None
+    height = float(page.get("height") or 800.0)
+    edge_dist = lambda f: min(f["y"], max(0.0, height - f["y"]))
+    best_edge = min(edge_dist(f) for f in folios)
+    edge_folios = [f for f in folios if edge_dist(f) <= best_edge + 12]
+    if anchor.get("bbox"):
+        x = (anchor["bbox"][0] + anchor["bbox"][2]) / 2
+        return min(edge_folios, key=lambda f: abs(f["x"] - x))["number"]
+    return edge_folios[0]["number"]
 
 
-def _heading_score(text, heading, max_lines=180):
-    """Score whether a phrase is functioning as a page heading, not merely a body reference."""
-    target = _compact(heading)
-    lines = [_norm_line(x) for x in text.splitlines()[:max_lines] if _norm_line(x)]
-    compact = [_compact(x) for x in lines]
-    best = 0
-
-    for i in range(len(compact)):
-        # Exact one-line heading.
-        if compact[i] == target:
-            score = 10
-            if lines[i].isupper():
-                score += 15
-            if i < 20:
-                score += 8
-            best = max(best, score)
-
-        # PDF extraction often splits a heading over 2-3 lines.
-        for width in (2, 3):
-            if i + width <= len(compact) and "".join(compact[i:i+width]) == target:
-                score = 9
-                joined_original = " ".join(lines[i:i+width])
-                if joined_original.isupper():
-                    score += 15
-                if i < 20:
-                    score += 8
-                best = max(best, score)
-
-    return best
-
-BOUNDARY_SECTIONS = [
-    ("Directors' Report", ["directors' report", "directors’ report", "director's report", "board's report", "board’s report"]),
-    ("Management Discussion & Analysis", PRESETS["Management Discussion & Analysis"]["aliases"]),
-    ("Annexures", [
-        "annexures i to vi to the directors' report", "annexures i to vi to the directors’ report",
-        "annexure i to vi to the director's report", "annexures to the directors' report",
-        "annexures to the directors’ report", "annexures i to vi", "annexures",
-    ]),
-    ("Corporate Governance Report", ["corporate governance report", "report on corporate governance"]),
-    ("BRSR", PRESETS["Business Responsibility & Sustainability Report (BRSR)"]["aliases"]),
-    ("BRR", PRESETS["Business Responsibility Report (BRR)"]["aliases"]),
-    ("ESG / Sustainability Report", PRESETS["ESG Report"]["aliases"] + PRESETS["Sustainability Report"]["aliases"]),
-    ("Standalone Financial Statements", ["standalone financial statements", "financial statements - standalone"]),
-    ("Consolidated Financial Statements", ["consolidated financial statements", "financial statements - consolidated"]),
-    ("Independent Auditor's Report", [
-        "independent auditor's report", "independent auditors' report", "independent auditor’s report",
-        "independent auditors’ report", "report on the audit of the standalone financial statements",
-    ]),
-    ("Notice", ["notice", "notice of annual general meeting"]),
-    ("GRI Index", ["gri index", "gri content index"]),
-]
-
-_SECTION_MAP_CACHE = {}
-
-
-def _doc_key(pages):
-    """Cheap cache key; avoids rebuilding the same section map for every checkbox."""
-    if not pages:
-        return (0,)
-    first = pages[0].get("text", "")[:500]
-    middle = pages[len(pages) // 2].get("text", "")[:300]
-    last = pages[-1].get("text", "")[-500:]
-    return (len(pages), hash(first), hash(middle), hash(last))
-
-
-def _printed_page_candidates(pages, printed_page):
-    if printed_page is None:
-        return []
-    return [i for i, p in enumerate(pages) if not _toc_like_page(p["text"]) and _contains_printed_page_number(p["text"], printed_page)]
-
-
-def _detect_section_start(pages, aliases):
-    """Return (physical_index, printed_page), using TOC first and heading scan as fallback."""
+def _detect_section_anchor(pages, aliases, min_score=54):
     aliases = _heading_variants(aliases)
     toc_page = _toc_printed_page(pages, aliases)
-
-    # Fast path: a Contents/Index entry gives the printed page. Among physical pages
-    # carrying that printed number, pick the one that actually contains the heading.
-    if toc_page is not None:
-        candidates = _printed_page_candidates(pages, toc_page)
-        best = None
-        for i in candidates:
-            score = max((_heading_score(pages[i]["text"], a, max_lines=320) for a in aliases), default=0)
-            candidate = (score, -i, i)
-            if best is None or candidate > best:
-                best = candidate
-        if best is not None and best[0] > 0:
-            return best[2], toc_page
-        if candidates:
-            # Printed-page mapping is still stronger than a random body mention.
-            return candidates[0], toc_page
-
-    # Fallback for reports with no useful TOC: require an actual heading-level match.
     best = None
-    for i, p in enumerate(pages):
-        if _toc_like_page(p["text"]):
+    target_compacts = [_compact(a) for a in aliases if _compact(a)]
+    for idx, page in enumerate(pages):
+        if _toc_like_page(page):
             continue
-        score = max((_heading_score(p["text"], a, max_lines=320) for a in aliases), default=0)
-        if score <= 0:
+        page_compact = _compact(page.get("text", ""))
+        if not any(t in page_compact for t in target_compacts):
             continue
-        candidate = (score, -i, i)
-        if best is None or candidate > best:
-            best = candidate
-    return (best[2], None) if best else (None, None)
+        folios = {f["number"] for f in _edge_folios(page)}
+        for cand in _window_candidates(page, aliases):
+            score = cand["score"]
+            if toc_page is not None and toc_page in folios:
+                score += 30
+            item = dict(cand)
+            item.update({
+                "index": idx,
+                "pdf_page": page.get("page"),
+                "score": score,
+            })
+            item["printed_page"] = _anchor_printed_page(page, item, toc_page=toc_page if toc_page in folios else None)
+            rank = (score, -idx, -item["line_order"])
+            if best is None or rank > best[0]:
+                best = (rank, item)
+    if not best or best[1]["score"] < min_score:
+        return None
+    # If TOC provided a page but the actual page could not expose its folio, retain the
+    # TOC page only when the heading itself is visually strong.
+    if best[1].get("printed_page") is None and toc_page is not None and best[1]["score"] >= 64:
+        best[1]["printed_page"] = toc_page
+    return best[1]
+
+
+def _discover_annexure_anchors(pages):
+    out = []
+    pat = re.compile(r"^\s*annexure\s*[-:]?\s*([ivxlcdm]+|\d{1,2})\b", re.I)
+    for idx, page in enumerate(pages):
+        if _toc_like_page(page):
+            continue
+        height = float(page.get("height") or 800.0)
+        lines = _page_lines(page)
+        sizes = [l.get("size") for l in lines if isinstance(l.get("size"), (int, float)) and 5 <= l.get("size") <= 15]
+        body = sorted(sizes)[len(sizes)//2] if sizes else 9.0
+        for line in lines[:40]:
+            text = _norm_line(line.get("text", ""))
+            m = pat.match(text)
+            if not m:
+                continue
+            bb = line.get("bbox")
+            size = line.get("size") or body
+            y0 = bb[1] if bb else 0
+            if bb and y0 > 0.30 * height and size < body + 1.5:
+                continue
+            anchor = {
+                "label": f"Annexure {m.group(1)}",
+                "aliases": [text],
+                "index": idx,
+                "pdf_page": page.get("page"),
+                "line_order": line.get("order", 0),
+                "line_end": line.get("order", 0),
+                "bbox": bb,
+                "score": 70,
+                "matched_alias": text,
+                "matched_text": text,
+            }
+            anchor["printed_page"] = _anchor_printed_page(page, anchor)
+            out.append(anchor)
+            break
+    return out
+
+
+def _anchor_key(a):
+    return (a["index"], a.get("line_order", 0))
 
 
 def build_section_map(pages):
-    """Discover high-level section starts once and sort them in document order."""
     key = _doc_key(pages)
     if key in _SECTION_MAP_CACHE:
         return _SECTION_MAP_CACHE[key]
 
     found = []
-    for label, aliases in BOUNDARY_SECTIONS:
-        idx, printed = _detect_section_start(pages, aliases)
-        if idx is None:
-            continue
-        found.append({
-            "label": label,
-            "aliases": aliases,
-            "index": idx,
-            "pdf_page": pages[idx].get("page"),
-            "printed_page": printed,
-        })
+    for label, aliases in BOUNDARY_SPECS:
+        min_score = 64 if label in {"Corporate Social Responsibility"} else 54
+        a = _detect_section_anchor(pages, aliases, min_score=min_score)
+        if a:
+            a = dict(a); a["label"] = label; a["aliases"] = aliases
+            found.append(a)
+    found.extend(_discover_annexure_anchors(pages))
 
-    # If multiple boundary labels land on one page, one physical boundary is enough.
-    by_index = {}
-    for item in found:
-        idx = item["index"]
-        old = by_index.get(idx)
-        if old is None or len(_compact(item["label"])) > len(_compact(old["label"])):
-            by_index[idx] = item
+    # Merge duplicate/overlapping anchors created by nested names such as
+    # "Sustainability Report" inside "Business Responsibility & Sustainability Report".
+    merged = []
+    for item in sorted(found, key=_anchor_key):
+        replaced = False
+        for j, old in enumerate(merged):
+            if item["index"] != old["index"]:
+                continue
+            a0, a1 = item.get("line_order", 0), item.get("line_end", item.get("line_order", 0))
+            b0, b1 = old.get("line_order", 0), old.get("line_end", old.get("line_order", 0))
+            overlap = not (a1 < b0 - 1 or b1 < a0 - 1)
+            mt = _compact(item.get("matched_text", "")); ot = _compact(old.get("matched_text", ""))
+            related = mt in ot or ot in mt
+            if overlap and related:
+                rank_item = (item.get("score", 0), len(mt), -a0)
+                rank_old = (old.get("score", 0), len(ot), -b0)
+                if rank_item > rank_old:
+                    merged[j] = item
+                replaced = True
+                break
+        if not replaced:
+            merged.append(item)
+    result = sorted(merged, key=_anchor_key)
 
-    result = sorted(by_index.values(), key=lambda x: x["index"])
     if len(_SECTION_MAP_CACHE) >= 24:
         _SECTION_MAP_CACHE.clear()
     _SECTION_MAP_CACHE[key] = result
     return result
 
 
-def _next_boundary(pages, start_idx, printed_start=None):
-    """End immediately before the next discovered document-level section."""
+def _next_boundary_anchor(pages, start_anchor, requested_label=None):
+    sk = _anchor_key(start_anchor)
     for item in build_section_map(pages):
-        if item["index"] > start_idx:
-            printed_end = None
-            if printed_start is not None and item.get("printed_page") is not None:
-                printed_end = item["printed_page"] - 1
-            return item["index"] - 1, printed_end
-    return len(pages) - 1, None
-
-def _preset_end(pages, start, printed_start, end_markers):
-    """Return (physical_end_index, printed_end_page_or_None)."""
-
-    # Best case: use the next section's page from the Contents/Index.
-    toc_candidates = []
-    if printed_start is not None:
-        for marker in end_markers:
-            p = _toc_printed_page(pages, marker)
-            if p is None or p <= printed_start:
-                continue
-            idx = _physical_index_for_printed_page(pages, p, start_after=start)
-            if idx is not None and idx > start:
-                toc_candidates.append((idx, p))
-
-        if toc_candidates:
-            boundary_idx, boundary_printed = min(toc_candidates, key=lambda x: x[0])
-            return boundary_idx - 1, boundary_printed - 1
-
-    # Fallback: look only for heading-level boundary markers on later pages.
-    for i in range(start + 1, len(pages)):
-        if any(_heading_score(pages[i]["text"], marker, max_lines=220) > 0 for marker in end_markers):
-            return i - 1, None
-
-    return len(pages) - 1, None
+        if _anchor_key(item) <= sk:
+            continue
+        # Board/Directors reports commonly contain several annexures. Treat the next
+        # named major section as the boundary, not Annexure 1 merely because it exists.
+        if requested_label in {"Board's Report", "Directors' Report"} and str(item.get("label", "")).lower().startswith("annexure"):
+            continue
+        return item
+    return None
 
 
-def _payload(raw_pages, clean_pages_, start, end, printed_start=None, printed_end=None):
-    raw_text = "\n\n".join(p["text"].strip() for p in raw_pages[start:end + 1]).strip()
-    clean_text = "\n\n".join(p["text"].strip() for p in clean_pages_[start:end + 1]).strip()
-    payload = {
-        "start_page": raw_pages[start].get("page"),
-        "end_page": raw_pages[end].get("page"),
-        "text": clean_text,
-        "raw_text": raw_text,
+def _leadership_end_anchor(pages, start_anchor, boundary_anchor, label):
+    """Use the last signature-role occurrence before the next major section.
+
+    This handles reports whose next page is font-corrupted (common in older PDFs),
+    while avoiding false MD extraction from a CEO title.
+    """
+    role_terms = {
+        "Chairman Message": ["chairman", "chairperson"],
+        "CEO Message": ["chief executive officer", "ceo"],
+        "Managing Director Message": ["managing director"],
+    }.get(label, [])
+    if not role_terms:
+        return boundary_anchor
+
+    stop_idx = boundary_anchor["index"] if boundary_anchor else min(len(pages), start_anchor["index"] + 12)
+    last_signature_idx = None
+    for idx in range(start_anchor["index"], min(stop_idx, start_anchor["index"] + 12)):
+        lines = [_norm_line(x.get("text", "")) for x in _page_lines(pages[idx]) if _norm_line(x.get("text", ""))]
+        if not lines:
+            continue
+        tail = " ".join(lines[-30:]).lower().replace("’", "'")
+        if any(term in tail for term in role_terms):
+            last_signature_idx = idx
+    if last_signature_idx is None:
+        return boundary_anchor
+
+    # Synthetic boundary at start of the physical page after the signature page.
+    ni = last_signature_idx + 1
+    if boundary_anchor and ni > boundary_anchor["index"]:
+        return boundary_anchor
+    if ni >= len(pages):
+        return None
+    return {
+        "label": "Leadership signature end",
+        "index": ni,
+        "pdf_page": pages[ni].get("page"),
+        "line_order": 0,
+        "printed_page": None,
+        "score": 100,
     }
-    if printed_start is not None:
-        payload["printed_start_page"] = printed_start
-    if printed_end is not None:
-        payload["printed_end_page"] = printed_end
+
+
+def _selected_line_text(page, start_order=None, end_order=None, clean_page=None):
+    lines = _page_lines(page)
+    if not lines:
+        return page.get("text", "").strip()
+    clean_allowed = None
+    if clean_page is not None:
+        clean_allowed = Counter(_norm_line(x) for x in clean_page.get("text", "").splitlines() if _norm_line(x))
+    chosen = []
+    for line in lines:
+        order = line.get("order", 0)
+        if start_order is not None and order < start_order:
+            continue
+        if end_order is not None and order >= end_order:
+            continue
+        text = _norm_line(line.get("text", ""))
+        if not text:
+            continue
+        if clean_allowed is not None:
+            if clean_allowed[text] <= 0:
+                continue
+            clean_allowed[text] -= 1
+        chosen.append(text)
+    return "\n".join(chosen).strip()
+
+
+def _payload_from_anchors(raw_pages, clean_pages_, start_anchor, boundary_anchor=None):
+    start_idx = start_anchor["index"]
+    boundary_idx = boundary_anchor["index"] if boundary_anchor else len(raw_pages)
+    raw_parts, clean_parts = [], []
+    used_pages = []
+
+    include_boundary_page = False
+    if boundary_anchor and boundary_idx < len(raw_pages):
+        ps = start_anchor.get("printed_page")
+        bp = boundary_anchor.get("printed_page")
+        if ps is not None and bp is not None and bp > ps:
+            folios = {f["number"] for f in _edge_folios(raw_pages[boundary_idx])}
+            # A physical spread may contain both the last page of this section and
+            # the first page of the next one (Apollo-style two-up PDFs).
+            include_boundary_page = (bp - 1) in folios and bp in folios
+    last_idx = boundary_idx if (boundary_anchor and include_boundary_page) else (boundary_idx - 1 if boundary_anchor else len(raw_pages) - 1)
+    for idx in range(start_idx, last_idx + 1):
+        if idx >= len(raw_pages):
+            break
+        start_order = start_anchor.get("line_order") if idx == start_idx else None
+        end_order = None
+        if boundary_anchor and include_boundary_page and idx == boundary_idx:
+            end_order = boundary_anchor.get("line_order")
+        if boundary_anchor and idx > boundary_idx:
+            break
+
+        r = _selected_line_text(raw_pages[idx], start_order=start_order, end_order=end_order)
+        c = _selected_line_text(raw_pages[idx], start_order=start_order, end_order=end_order, clean_page=clean_pages_[idx])
+        if r.strip():
+            raw_parts.append(r.strip())
+            clean_parts.append(c.strip() if c.strip() else r.strip())
+            used_pages.append(raw_pages[idx].get("page"))
+
+    if not used_pages:
+        return None
+
+    payload = {
+        "start_page": min(p for p in used_pages if p is not None) if any(p is not None for p in used_pages) else None,
+        "end_page": max(p for p in used_pages if p is not None) if any(p is not None for p in used_pages) else None,
+        "text": "\n\n".join(clean_parts).strip(),
+        "raw_text": "\n\n".join(raw_parts).strip(),
+        "detection_confidence": "high" if start_anchor.get("score", 0) >= 64 else "medium",
+    }
+    ps = start_anchor.get("printed_page")
+    if ps is not None:
+        payload["printed_start_page"] = ps
+    if boundary_anchor and ps is not None and boundary_anchor.get("printed_page") is not None and boundary_anchor["printed_page"] > ps:
+        payload["printed_end_page"] = boundary_anchor["printed_page"] - 1
     return payload
 
 
 def extract_preset(raw_pages, clean_pages_, label):
     cfg = PRESETS[label]
-    start, printed_start = _detect_section_start(clean_pages_, cfg["aliases"])
-    if start is None:
+    start = _detect_section_anchor(clean_pages_, cfg["aliases"])
+    if not start:
         return None
-
-    # Leadership pages often sit in the front matter where Contents and report page 1
-    # can share a physical page. Their small, explicit end-marker lists are safer.
+    boundary = _next_boundary_anchor(clean_pages_, start, requested_label=label)
     if label in {"Chairman Message", "CEO Message", "Managing Director Message"}:
-        end, printed_end = _preset_end(clean_pages_, start, printed_start, cfg["end"])
-    else:
-        end, printed_end = _next_boundary(clean_pages_, start, printed_start)
-
-    if end < start:
-        end, printed_end = start, printed_start
-
-    return _payload(
-        raw_pages, clean_pages_, start, end,
-        printed_start=printed_start,
-        printed_end=printed_end,
-    )
+        boundary = _leadership_end_anchor(clean_pages_, start, boundary, label)
+    return _payload_from_anchors(raw_pages, clean_pages_, start, boundary)
 
 
 def extract_custom(raw_pages, clean_pages_, heading):
-    """Arbitrary section: exact TOC/heading start, then stop at the next major section."""
     heading = _norm_line(heading)
     if not heading:
         return None
 
-    start, printed_start = _detect_section_start(clean_pages_, [heading])
-    if start is None:
+    # Common custom labels get their precise aliases; this prevents a requested
+    # "Directors' Report" from silently returning a different "Board's Report".
+    alias_map = {
+        _compact("Directors' Report"): ["directors' report", "directors’ report", "director's report", "directors' report to the shareholders", "directors’ report to the shareholders"],
+        _compact("Board's Report"): ["board's report", "boards' report", "boards’ report"],
+        _compact("Corporate Governance Report"): ["corporate governance report", "report on corporate governance"],
+        _compact("Corporate social responsibility"): ["corporate social responsibility", "corporate social responsibility report", "csr report"],
+    }
+    aliases = alias_map.get(_compact(heading), [heading])
+    start = _detect_section_anchor(clean_pages_, aliases)
+    if not start:
         return None
-
-    end, printed_end = _next_boundary(clean_pages_, start, printed_start)
-    if end < start:
-        end, printed_end = start, printed_start
-
-    return _payload(
-        raw_pages, clean_pages_, start, end,
-        printed_start=printed_start,
-        printed_end=printed_end,
-    )
+    requested = "Board's Report" if _compact(heading) == _compact("Board's Report") else ("Directors' Report" if _compact(heading) == _compact("Directors' Report") else heading)
+    boundary = _next_boundary_anchor(clean_pages_, start, requested_label=requested)
+    return _payload_from_anchors(raw_pages, clean_pages_, start, boundary)
 
 
 def combine_sections(raw_pages, clean_pages_, sections, labels, combined_label):
-    """Combine only the exact detected message sections.
-
-    Important: do NOT take one continuous min-to-max page range, because unrelated
-    pages may sit between Chairman and MD/CEO messages.
-    """
     present = [(label, sections[label]) for label in labels if label in sections]
     if not present:
         return None
-
-    clean_parts = []
-    raw_parts = []
-    page_ranges = []
-    printed_ranges = []
-
+    clean_parts, raw_parts, page_ranges, printed_ranges = [], [], [], []
     for label, sec in present:
-        clean_parts.append(sec.get("text", "").strip())
-        raw_parts.append(sec.get("raw_text", sec.get("text", "")).strip())
-
+        if sec.get("text", "").strip():
+            clean_parts.append(sec["text"].strip())
+            raw_parts.append(sec.get("raw_text", sec["text"]).strip())
         if sec.get("start_page") is not None:
-            page_ranges.append({
-                "label": label,
-                "start_page": sec.get("start_page"),
-                "end_page": sec.get("end_page"),
-            })
-
+            page_ranges.append({"label": label, "start_page": sec.get("start_page"), "end_page": sec.get("end_page")})
         if sec.get("printed_start_page") is not None:
-            printed_ranges.append({
-                "label": label,
-                "start_page": sec.get("printed_start_page"),
-                "end_page": sec.get("printed_end_page", sec.get("printed_start_page")),
-            })
-
-    starts = [r["start_page"] for r in page_ranges]
-    ends = [r["end_page"] for r in page_ranges]
-
+            printed_ranges.append({"label": label, "start_page": sec.get("printed_start_page"), "end_page": sec.get("printed_end_page", sec.get("printed_start_page"))})
     payload = {
-        "start_page": min(starts) if starts else None,
-        "end_page": max(ends) if ends else None,
+        "start_page": min((r["start_page"] for r in page_ranges), default=None),
+        "end_page": max((r["end_page"] for r in page_ranges), default=None),
         "page_ranges": page_ranges,
-        "text": "\n\n".join(x for x in clean_parts if x).strip(),
-        "raw_text": "\n\n".join(x for x in raw_parts if x).strip(),
+        "text": "\n\n".join(clean_parts).strip(),
+        "raw_text": "\n\n".join(raw_parts).strip(),
         "combined_from": [label for label, _ in present],
     }
-
     if printed_ranges:
         payload["printed_page_ranges"] = printed_ranges
         payload["printed_start_page"] = min(r["start_page"] for r in printed_ranges)
         payload["printed_end_page"] = max(r["end_page"] for r in printed_ranges)
-
     return payload
 
 
@@ -639,37 +854,23 @@ def base_stem(filename):
 
 def infer_metadata(filename, pages):
     stem = base_stem(filename)
-
-    # ---- Financial year detection ----
-    # Prefer explicit annual-report labels near the front of the document.
-    front = "\n".join(p.get("text", "")[:8000] for p in pages[:8])
+    front = "\n".join(p.get("text", "")[:12000] for p in pages[:12])
     year = None
 
     explicit_patterns = [
         r"(?:integrated\s+)?annual\s+report(?:\s*&\s*accounts)?(?:\s+for\s+the\s+year)?\s*[:\-]?\s*(20\d{2})\s*[-–—/]\s*(20\d{2}|\d{2})",
-        r"annual\s+report.{0,80}?(20\d{2})\s*[-–—/]\s*(20\d{2}|\d{2})",
+        r"annual\s+report.{0,100}?(20\d{2})\s*[-–—/]\s*(20\d{2}|\d{2})",
         r"(?:financial\s+year|FY)\s*[:\-]?\s*(20\d{2})\s*[-–—/]\s*(20\d{2}|\d{2})",
     ]
-
     for pattern in explicit_patterns:
         m = re.search(pattern, front, re.I | re.S)
         if m:
-            y1, y2 = m.group(1), m.group(2)
-            year = f"{y1}-{y2[-2:]}"
+            year = f"{m.group(1)}-{m.group(2)[-2:]}"
             break
-
-    # Older reports often say only "year ended 31st March, 2015".
     if not year:
-        m = re.search(
-            r"year\s+ended\s+(?:on\s+)?31(?:st)?\s+March[,\s]+(20\d{2})",
-            front,
-            re.I,
-        )
+        m = re.search(r"year\s+ended\s+(?:on\s+)?31(?:st)?\s+March[,]?\s+(20\d{2})", front, re.I)
         if m:
-            end_year = int(m.group(1))
-            year = f"{end_year - 1}-{str(end_year)[-2:]}"
-
-    # Filename is a last resort only.
+            end_year = int(m.group(1)); year = f"{end_year - 1}-{str(end_year)[-2:]}"
     if not year:
         m = re.search(r"\b(20\d{2})\s*[-–—_/]\s*(\d{2,4})\b", filename)
         if m:
@@ -679,42 +880,43 @@ def infer_metadata(filename, pages):
             if m:
                 year = m.group(1)
 
-    # ---- Company name detection ----
+    # Filename company is trusted only when it contains meaningful alphabetic content.
     company = re.sub(r"\s*\(\d+\)\s*$", "", stem)
     company = re.sub(r"[_-]+", " ", company)
     company = re.sub(r"\b(?:Integrated\s+)?Annual\s+Report\b", " ", company, flags=re.I)
-    company = re.sub(
-        r"\b(?:Full\s*Text|Outputs?|Output|BRSR|BRR|ESG|MDA|"
-        r"Management\s+Discussion(?:\s*&\s*Analysis)?|Chairman(?:'s)?\s+Message|"
-        r"CEO\s+Message|MD\s+Message)\b",
-        " ", company, flags=re.I,
-    )
     company = re.sub(r"\b20\d{2}(?:\s*[-–—_/]?\s*\d{2,4})?\b", " ", company)
-    company = re.sub(r"\s+", " ", company).strip(" _-") or stem.replace("_", " ").strip()
+    company = re.sub(r"\s+", " ", company).strip(" _-")
+    generic = not company or not re.search(r"[A-Za-z]{3,}", company) or company.lower() in {"report", "document", "annual report"}
 
-    # Generic filenames such as 2015.pdf / 2020.pdf: infer company from document text.
-    if re.fullmatch(r"(?:20\d{2}|annual report|report|document)", company.strip(), re.I):
-        text_sample = "\n".join(p.get("text", "") for p in pages[:20])
-        candidates = re.findall(
-            r"(?im)^\s*([A-Z][A-Za-z0-9&.,'()\- ]{2,100}\s(?:Limited|Ltd\.?))\s*$",
-            text_sample
+    if generic:
+        sample = "\n".join(p.get("text", "") for p in pages[:50])
+        # Strong labelled fields first.
+        labelled = re.search(
+            r"(?is)(?:name\s+of\s+(?:the\s+)?(?:company|listed\s+entity)|company\s+name)\s*[:\-]?\s*([A-Z][A-Za-z0-9&.,'()\- ]{2,120}?(?:Limited|Ltd\.?))",
+            sample,
         )
-        blocked = {
-            "BSE Limited",
-            "National Stock Exchange of India Limited",
-            "Central Depository Services India Limited",
-            "National Securities Depository Limited",
-        }
-        cleaned = []
-        for c in candidates:
-            c = re.sub(r"\s+", " ", c).strip()
-            if c not in blocked:
+        if labelled:
+            company = labelled.group(1)
+        else:
+            candidates = re.findall(r"(?im)^\s*(?:For\s+)?([A-Z][A-Za-z0-9&.,'()\- ]{2,110}?(?:Limited|Ltd\.?))\s*$", sample)
+            blocked_terms = [
+                "stock exchange", "bse limited", "depository", "securities", "auditor", "assurance",
+                "chartered accountants", "registrar", "trustee", "bank limited",
+            ]
+            cleaned = []
+            for c in candidates:
+                c = re.sub(r"^For\s+", "", c, flags=re.I)
+                c = re.sub(r"\s+", " ", c).strip(" ,.-")
+                if any(b in c.lower() for b in blocked_terms):
+                    continue
                 cleaned.append(c)
-        if cleaned:
-            company = Counter(cleaned).most_common(1)[0][0]
-            company = re.sub(r"\s+Limited$", "", company, flags=re.I).strip()
+            if cleaned:
+                company = Counter(cleaned).most_common(1)[0][0]
 
-    return {"company": company, "year": year or "Year not detected", "source_file": filename}
+    company = re.sub(r"^For\s+", "", company or "", flags=re.I)
+    company = re.sub(r"\s+", " ", company).strip(" ,.-")
+    company = re.sub(r"\s+Limited$", "", company, flags=re.I).strip()
+    return {"company": company or stem.replace("_", " ").strip(), "year": year or "Year not detected", "source_file": filename}
 
 
 

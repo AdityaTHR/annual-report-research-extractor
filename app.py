@@ -122,6 +122,40 @@ def safe_folder(text):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_") or "report"
 
 
+def payload_location(payload, full_count=None):
+    if full_count is not None:
+        return f"{full_count} pages" if full_count > 1 else "Complete document"
+
+    printed_ranges = payload.get("printed_page_ranges") or []
+    if printed_ranges:
+        parts = []
+        for r in printed_ranges:
+            s, e = r.get("start_page"), r.get("end_page")
+            parts.append(f"{s}-{e}" if s != e else f"{s}")
+        return "Report pages " + " + ".join(parts)
+
+    ps, pe = payload.get("printed_start_page"), payload.get("printed_end_page")
+    s, e = payload.get("start_page"), payload.get("end_page")
+    if ps is not None:
+        report = f"Report pages {ps}-{pe}" if pe is not None and pe != ps else f"Report page {ps}"
+        if s is not None:
+            pdf = f"PDF pages {s}-{e}" if e is not None and e != s else f"PDF page {s}"
+            return f"{report} • {pdf}"
+        return report
+
+    page_ranges = payload.get("page_ranges") or []
+    if page_ranges:
+        parts = []
+        for r in page_ranges:
+            a, b = r.get("start_page"), r.get("end_page")
+            parts.append(f"{a}-{b}" if a != b else f"{a}")
+        return "PDF pages " + " + ".join(parts)
+
+    if s is not None:
+        return f"PDF pages {s}-{e}" if e is not None and e != s else f"PDF page {s}"
+    return "Detected"
+
+
 mode = st.radio(
     "Processing mode",
     ["Research Library", "Bulk Processing"],
@@ -257,10 +291,9 @@ if mode == "Bulk Processing":
                     item_index = {}
                     for label, payload in result["items"].items():
                         if label == "Full Report":
-                            location = f"{len(result['raw_pages'])} pages" if len(result["raw_pages"]) > 1 else "Complete document"
+                            location = payload_location(payload, full_count=len(result["raw_pages"]))
                         else:
-                            s, e = payload.get("start_page"), payload.get("end_page")
-                            location = f"Pages {s}-{e}" if s is not None else "Detected"
+                            location = payload_location(payload)
 
                         safe = safe_label(label)
                         fmt_files = {}
@@ -483,10 +516,9 @@ else:
                     cols[0].markdown(f"**{label}**")
 
                     if label == "Full Report":
-                        loc = f"{len(r['raw_pages'])} pages" if len(r["raw_pages"]) > 1 else "Complete"
+                        loc = payload_location(payload, full_count=len(r["raw_pages"]))
                     else:
-                        s, e = payload.get("start_page"), payload.get("end_page")
-                        loc = f"Pages {s}-{e}" if s is not None else "Detected"
+                        loc = payload_location(payload)
                     cols[1].caption(loc)
 
                     safe = safe_label(label)
