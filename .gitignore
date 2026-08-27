@@ -4,3 +4,17 @@ __pycache__/
 *.zip
 output/
 .DS_Store
+
+# Python / local environment
+# Extraction caches
+.v13_cache/
+.v13_unseen_cache/
+*.pkl.gz
+# Local test PDFs and generated data
+samples/
+unseen_samples/
+# Validation outputs
+v13_6_graph_nodes.csv
+v13_6_unseen_diagnostics.json
+# Local old backup
+extractor_V11_backup.py
