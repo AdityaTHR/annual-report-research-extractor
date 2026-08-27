@@ -52,7 +52,7 @@ def detect_sections(raw_pages, research_pages, leadership, mda, sustainability, 
                 break
 
     for heading in custom_heads:
-        sec = extract_custom(raw_pages, research_pages, heading)
+        sec = extract_custom(raw_pages, research_pages, heading, custom_heads)
         if sec:
             sections[heading] = sec
 
