@@ -9,6 +9,8 @@ from functools import lru_cache
 from copy import deepcopy
 from difflib import SequenceMatcher
 
+# V13 Generic R4.1: unseen-noise hardening (company/year/page agnostic)
+
 try:
     import pymupdf as fitz
 except Exception:
@@ -372,7 +374,7 @@ BOUNDARY_SPECS = [
     ("Chairman Message", PRESETS["Chairman Message"]["aliases"]),
     ("CEO Message", PRESETS["CEO Message"]["aliases"]),
     ("Managing Director Message", PRESETS["Managing Director Message"]["aliases"]),
-    ("Board's Report", ["board's report", "boards' report", "boards’ report"]),
+    ("Board's Report", ["board's report", "boards' report", "boards’ report", "report of the board of directors", "board of directors' report", "board of directors’ report", "report of directors"]),
     ("Directors' Report", ["directors' report", "directors’ report", "director's report", "directors' report to the shareholders"]),
     ("Management Discussion & Analysis", PRESETS["Management Discussion & Analysis"]["aliases"]),
     ("Corporate Governance Report", ["corporate governance report", "report on corporate governance"]),
@@ -700,7 +702,7 @@ def _anchor_printed_page(page, anchor, toc_page=None):
         return min(edge_folios, key=lambda f: abs(f["x"] - x))["number"]
     return edge_folios[0]["number"]
 
-def _detect_section_anchor(pages, aliases, min_score=54):
+def _detect_section_anchor(pages, aliases, min_score=54, candidate_rejector=None):
     aliases = _heading_variants(aliases)
     toc_page = _toc_printed_page(pages, aliases)
     best = None
@@ -728,6 +730,21 @@ def _detect_section_anchor(pages, aliases, min_score=54):
                 actual_pp = _anchor_printed_page(page, item)
                 score = cand["score"]
 
+                # Loose canonical names embedded inside ordinary body sentences are
+                # references, not automatically section starts.
+                alias_c = _compact(cand.get("matched_alias", ""))
+                text_c = _compact(cand.get("matched_text", ""))
+                if source == "native" and alias_c and text_c != alias_c and len(text_c) > len(alias_c) + 14:
+                    raw_match = _norm_line(cand.get("matched_text", ""))
+                    word_count = len(re.findall(r"[A-Za-z]+", raw_match))
+                    sentence_like = (
+                        word_count >= 6
+                        or raw_match.startswith(("•", "-", "–", "—"))
+                        or raw_match.endswith((".", ";", ":"))
+                    )
+                    if sentence_like:
+                        score -= 18
+
                 if toc_page is not None and actual_pp is not None:
                     dist = abs(actual_pp - toc_page)
                     if dist == 0: score += 45
@@ -739,6 +756,9 @@ def _detect_section_anchor(pages, aliases, min_score=54):
 
                 item["score"] = score; item["printed_page"] = actual_pp
                 if actual_pp is None and toc_page is not None and score >= 66: item["printed_page"] = toc_page
+
+                if candidate_rejector is not None and candidate_rejector(item):
+                    continue
 
                 distance_rank = -abs((actual_pp if actual_pp is not None else 10**6) - toc_page) if toc_page is not None else 0
                 rank = (score, distance_rank, -idx, -item.get("line_order", 0))
@@ -918,13 +938,39 @@ def _median(values, default=0.0):
 
 def _looks_like_heading_text(text):
     text = _norm_line(text)
-    if not (2 <= len(text) <= 150) or not re.search(r"[A-Za-z]", text): return False
+    if not (2 <= len(text) <= 150) or not re.search(r"[A-Za-z]", text):
+        return False
+
+    # Generic table/list-cell noise is not a document heading.
+    token = text.strip().lower()
+    if re.fullmatch(r"\(?[a-zivxlcdm]{1,3}\)?[.)]?", token):
+        return False
+    compact_token = _compact(token)
+    if compact_token in {
+        "na", "nil", "yes", "no", "and", "or", "on", "in", "for", "the",
+        "a", "an", "sr", "it", "we", "share", "capital", "rate", "age",
+        # Generic table / financial-statement stubs. Canonical section detection
+        # still handles real Financial Statements / Notes headings separately.
+        "financial", "statement", "statements", "total", "particulars",
+        "note", "notes",
+    }:
+        return False
+    if re.fullmatch(r"(?:in)?%|%[a-z/]*", compact_token):
+        return False
+
     words = re.findall(r"[A-Za-z][A-Za-z&'’/-]*", text)
-    if not (1 <= len(words) <= 18) or text.endswith((".", ";", ",")): return False
+    if not (1 <= len(words) <= 18) or text.endswith((".", ";", ",")):
+        return False
     low = text.lower().strip(" :-–—")
-    noisy_prefixes = ("section a", "section b", "section c", "principle ", "note ", "notes ", "sr no", "sr. no", "particulars", "question ", "table ", "figure ", "amount in", "(`", "(%", "source:", "source ", "page ")
-    if any(low.startswith(x) for x in noisy_prefixes): return False
-    if sum(ch.isdigit() for ch in text) > max(6, len(text) * 0.25): return False
+    noisy_prefixes = (
+        "section a", "section b", "section c", "principle ", "note ", "notes ",
+        "sr no", "sr. no", "particulars", "question ", "table ", "figure ",
+        "amount in", "(`", "(%", "source:", "source ", "page ",
+    )
+    if any(low.startswith(x) for x in noisy_prefixes):
+        return False
+    if sum(ch.isdigit() for ch in text) > max(6, len(text) * 0.25):
+        return False
     return True
 
 def _doc_body_font_size(pages):
@@ -1027,6 +1073,37 @@ def _layout_class_for_native_line(page, text, bbox=None):
         if related and best != "title": best = cls
     return best
 
+def _generic_visual_candidate_allowed(text, toc_match, printed_page, layout_cls, sz, primary, strongly_isolated):
+    """Suppress table/list noise without company-, year- or page-specific rules."""
+    t = _norm_line(text)
+    if not _looks_like_heading_text(t):
+        return False
+
+    low = t.lower().strip(" :-–—")
+    # Running report titles / folios are document furniture, not section boundaries.
+    if re.search(r"\b(?:integrated\s+)?annual\s+report\b", low) and re.search(r"20\d{2}", low):
+        return False
+
+    words = re.findall(r"[A-Za-z][A-Za-z&'’/-]*", t)
+    toc_page_ok = False
+    if toc_match and printed_page is not None:
+        try:
+            toc_page_ok = abs(int(printed_page) - int(toc_match["printed_page"])) <= 1
+        except Exception:
+            toc_page_ok = False
+
+    if len(words) == 1:
+        visually_strong = (
+            layout_cls in {"title", "section-header"}
+            and sz >= primary * 1.10
+            and strongly_isolated
+        )
+        if not (toc_page_ok or visually_strong):
+            return False
+
+    return True
+
+
 def _discover_generic_top_level_anchors(pages, seed_nodes):
     body = _doc_body_font_size(pages)
     primary = _primary_heading_font_size(pages, seed_nodes)
@@ -1075,12 +1152,28 @@ def _discover_generic_top_level_anchors(pages, seed_nodes):
             letters = re.sub(r"[^A-Za-z]", "", text)
             if letters and text.upper() == text and len(letters) >= 8: score += 4
 
-            accept = False
-            if toc_match and score >= 62: accept = True
-            elif score >= 84 and sz >= primary * 0.95 and (strongly_isolated or layout_cls in {"title", "section-header"}): accept = True
-            if not accept: continue
+            if not _generic_visual_candidate_allowed(
+                text, toc_match, printed_page, layout_cls, sz, primary, strongly_isolated
+            ):
+                continue
 
-            hard_boundary = bool(toc_match and sz >= primary * 0.95)
+            accept = False
+            if toc_match and score >= 62:
+                accept = True
+            elif score >= 96 and sz >= primary * 0.95 and (strongly_isolated or layout_cls in {"title", "section-header"}):
+                # Pure visual unknown headings are diagnostic-only soft nodes. Keep
+                # only strong ones so tables / decorative callouts do not bloat the graph.
+                accept = True
+            if not accept:
+                continue
+
+            toc_page_agreement = False
+            if toc_match and printed_page is not None:
+                try:
+                    toc_page_agreement = abs(int(printed_page) - int(toc_match["printed_page"])) <= 1
+                except Exception:
+                    toc_page_agreement = False
+            hard_boundary = bool(toc_page_agreement and sz >= primary * 0.95)
             
             anchor = {
                 "label": "Generic Boundary", "aliases": [text], "index": idx, "pdf_page": page.get("page"),
@@ -1107,15 +1200,50 @@ def _merge_global_nodes(nodes):
     for item in sorted(nodes, key=_anchor_key):
         duplicate_at = None
         for j, old in enumerate(merged):
-            if not _same_anchor_region(item, old): continue
-            ic = _compact(item.get("matched_text", "")); oc = _compact(old.get("matched_text", ""))
-            related = not ic or not oc or ic in oc or oc in ic or SequenceMatcher(None, ic, oc).ratio() >= 0.82
-            if related: duplicate_at = j; break
-        if duplicate_at is None: merged.append(item); continue
+            # One physical line/order can only represent one structural node.
+            # Prefer canonical/custom/semantic evidence over generic visual fragments.
+            same_exact_position = (
+                item.get("index") == old.get("index")
+                and item.get("line_order", 0) == old.get("line_order", 0)
+            )
+            if same_exact_position:
+                duplicate_at = j
+                break
+
+            if not _same_anchor_region(item, old):
+                continue
+            ic = _compact(item.get("matched_text", ""))
+            oc = _compact(old.get("matched_text", ""))
+            related = (
+                not ic or not oc or ic in oc or oc in ic
+                or SequenceMatcher(None, ic, oc).ratio() >= 0.82
+            )
+            if related:
+                duplicate_at = j
+                break
+
+        if duplicate_at is None:
+            merged.append(item)
+            continue
+
         old = merged[duplicate_at]
-        rank_item = (0 if item.get("generic_boundary") else 1, 1 if item.get("custom_requested") else 0, item.get("score", 0), len(_compact(item.get("matched_text", ""))))
-        rank_old = (0 if old.get("generic_boundary") else 1, 1 if old.get("custom_requested") else 0, old.get("score", 0), len(_compact(old.get("matched_text", ""))))
-        if rank_item > rank_old: merged[duplicate_at] = item
+        rank_item = (
+            0 if item.get("generic_boundary") else 1,
+            1 if item.get("custom_requested") else 0,
+            1 if item.get("detection_source") == "annexure-semantic" else 0,
+            item.get("score", 0),
+            len(_compact(item.get("matched_text", ""))),
+        )
+        rank_old = (
+            0 if old.get("generic_boundary") else 1,
+            1 if old.get("custom_requested") else 0,
+            1 if old.get("detection_source") == "annexure-semantic" else 0,
+            old.get("score", 0),
+            len(_compact(old.get("matched_text", ""))),
+        )
+        if rank_item > rank_old:
+            merged[duplicate_at] = item
+
     return sorted(merged, key=_anchor_key)
 
 def build_section_map(pages):
@@ -1125,7 +1253,10 @@ def build_section_map(pages):
     found = []
     for label, aliases in BOUNDARY_SPECS:
         min_score = 64 if label in {"Corporate Social Responsibility"} else 54
-        a = _detect_section_anchor(pages, aliases, min_score=min_score)
+        a = _detect_section_anchor(
+            pages, aliases, min_score=min_score,
+            candidate_rejector=lambda cand, _label=label: _canonical_candidate_is_reference(_label, cand, pages),
+        )
         if a: a = dict(a); a["label"] = label; a["aliases"] = aliases; found.append(a)
     found.extend(_discover_annexure_anchors(pages))
     found.extend(resolve_annexure_headings(pages))
@@ -1190,9 +1321,25 @@ def build_global_section_graph(pages, custom_headings=None):
     nodes = [dict(x) for x in base_nodes]
     for heading in custom_headings:
         heading = _norm_line(heading)
-        if not heading: continue
+        if not heading:
+            continue
         a = _detect_section_anchor(pages, [heading])
-        if a: a = dict(a); a.update({"label": heading, "aliases": [heading], "custom_requested": True, "detection_source": a.get("detection_source") or "custom-visual"}); nodes.append(a)
+        if a:
+            a = dict(a)
+            source = str(a.get("detection_source") or "")
+            exactish = _compact(a.get("matched_text", "")) == _compact(heading)
+            # Loose body mentions such as "breaches in IT/cybersecurity" should
+            # not become researcher-requested structural nodes.
+            if not exactish and source == "native" and not _candidate_has_top_level_evidence(pages, a):
+                a = None
+        if a:
+            a.update({
+                "label": heading,
+                "aliases": [heading],
+                "custom_requested": True,
+                "detection_source": a.get("detection_source") or "custom-visual",
+            })
+            nodes.append(a)
     return _merge_global_nodes(nodes)
 
 def _candidate_local_context(pages, candidate, before_lines=8, after_lines=28):
@@ -1247,6 +1394,68 @@ def _candidate_has_top_level_evidence(pages, candidate):
             return True
     return False
 
+
+
+def _canonical_candidate_is_reference(label, candidate, pages):
+    """Return True when a canonical-name hit is a body/subsection reference, not a peer section.
+
+    This is deliberately document-generic: it uses syntactic role, section semantics and
+    visual/TOC evidence rather than company names, years, annexure numbers or page ranges.
+    """
+    label = _canonical_request_label(label)
+    source = str(candidate.get("detection_source") or "")
+    if source in {"annexure-semantic", "separate-appendix", "toc-logical-boundary"}:
+        return False
+
+    text = _norm_line(candidate.get("matched_text", ""))
+    if not text:
+        return True
+    low = text.lower().replace("’", "'").strip()
+    tc = _compact(text)
+    alias_c = _compact(candidate.get("matched_alias", ""))
+
+    # Exact short canonical headings remain valid.
+    exactish = bool(alias_c and tc == alias_c)
+
+    # Statutory-form subsections such as "SECTION A: GENERAL INFORMATION ABOUT THE
+    # COMPANY" are not the report's front-matter "About Company" section.
+    if label in _FRONT_MATTER_LABELS and re.match(r"^section\s+[a-z0-9ivxlcdm]+\b", low):
+        return True
+
+    # A financial-statement name inside the auditor's heading or a Board-report sentence
+    # is a reference to those statements, not their structural start.
+    if label in {"Standalone Financial Statements", "Consolidated Financial Statements"}:
+        if re.search(r"\breport\s+on\s+(?:the\s+)?audit\s+of\s+(?:the\s+)?(?:standalone|consolidated)\s+financial\s+statements\b", low):
+            return True
+        if re.search(r"\bbased\s+on\b.{0,80}\b(?:standalone|consolidated)?\s*financial\s+statements\b", low):
+            return True
+        if re.search(r"\b(?:overview\s+and\s+)?notes?\s+(?:forming\s+part\s+of|to)\s+(?:the\s+)?(?:standalone|consolidated)\s+financial\s+statements\b", low):
+            return True
+
+    # Financial-statement notes mentioning CSR are not the CSR report itself.
+    if label == "Corporate Social Responsibility" and re.match(r"^(?:note|notes)\b", low):
+        return True
+
+    if exactish:
+        return False
+
+    words = re.findall(r"[A-Za-z]+", text)
+    sentence_like = (
+        len(words) >= 7
+        or text.startswith(("•", "-", "–", "—"))
+        or text.endswith((".", ";", ":"))
+    )
+
+    # For a longer / embedded match, demand independent top-level evidence. This rejects
+    # phrases such as "...based on consolidated financial statements" while preserving
+    # genuinely styled headings with strong TOC / font / title evidence.
+    if alias_c and len(tc) > len(alias_c) + 14:
+        if sentence_like and candidate.get("score", 0) < 76:
+            return True
+        if not _candidate_has_top_level_evidence(pages, candidate):
+            return True
+
+    return False
 
 _BOARD_REFERENCE_LABELS = {
     "Management Discussion & Analysis", "Corporate Governance Report",
@@ -1498,11 +1707,17 @@ def extract_preset(raw_pages, clean_pages_, label):
         start = _find_separate_appendix_anchor(clean_pages_, cfg["aliases"])
         if not start: return None
     elif not start:
-        start = _detect_section_anchor(clean_pages_, cfg["aliases"])
+        start = _detect_section_anchor(
+            clean_pages_, cfg["aliases"],
+            candidate_rejector=lambda cand: _canonical_candidate_is_reference(label, cand, clean_pages_),
+        )
         if not start: start = _native_exact_heading_anchor(clean_pages_, cfg["aliases"])
         if not start: start = _graph_start_for_label(clean_pages_, label)
         if not start and raw_pages is not clean_pages_:
-            start = _detect_section_anchor(raw_pages, cfg["aliases"])
+            start = _detect_section_anchor(
+                raw_pages, cfg["aliases"],
+                candidate_rejector=lambda cand: _canonical_candidate_is_reference(label, cand, raw_pages),
+            )
             if not start: start = _native_exact_heading_anchor(raw_pages, cfg["aliases"])
             if not start: start = _graph_start_for_label(raw_pages, label)
     if not start: return None
@@ -1521,7 +1736,7 @@ def extract_custom(raw_pages, clean_pages_, heading, custom_headings=None):
 
     alias_map = {
         _compact("Directors' Report"): ["directors' report", "directors’ report", "director's report", "directors' report to the shareholders"],
-        _compact("Board's Report"): ["board's report", "boards' report", "boards’ report"],
+        _compact("Board's Report"): ["board's report", "boards' report", "boards’ report", "report of the board of directors", "board of directors' report", "board of directors’ report", "report of directors"],
         _compact("Corporate Governance Report"): ["corporate governance report", "report on corporate governance"],
         _compact("Corporate social responsibility"): ["corporate social responsibility", "corporate social responsibility report", "csr report"],
     }
@@ -1533,11 +1748,24 @@ def extract_custom(raw_pages, clean_pages_, heading, custom_headings=None):
         start = _native_visual_wrapper_anchor(clean_pages_, aliases, kind="board")
         if not start and raw_pages is not clean_pages_:
             start = _native_visual_wrapper_anchor(raw_pages, aliases, kind="board")
-    if not start: start = _detect_section_anchor(clean_pages_, aliases)
+    if not start:
+        start = _detect_section_anchor(
+            clean_pages_, aliases,
+            candidate_rejector=(
+                (lambda cand: _canonical_candidate_is_reference(requested, cand, clean_pages_))
+                if requested in {x[0] for x in BOUNDARY_SPECS} else None
+            ),
+        )
     if not start: start = _native_exact_heading_anchor(clean_pages_, aliases)
     if not start: start = _graph_start_for_label(clean_pages_, requested, custom_headings=custom_headings)
     if not start and raw_pages is not clean_pages_:
-        start = _detect_section_anchor(raw_pages, aliases)
+        start = _detect_section_anchor(
+            raw_pages, aliases,
+            candidate_rejector=(
+                (lambda cand: _canonical_candidate_is_reference(requested, cand, raw_pages))
+                if requested in {x[0] for x in BOUNDARY_SPECS} else None
+            ),
+        )
         if not start: start = _native_exact_heading_anchor(raw_pages, aliases)
         if not start: start = _graph_start_for_label(raw_pages, requested, custom_headings=custom_headings)
     if not start: return None
