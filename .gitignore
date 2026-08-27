@@ -18,3 +18,4 @@ v13_6_graph_nodes.csv
 v13_6_unseen_diagnostics.json
 # Local old backup
 extractor_V11_backup.py
+.v14_cache/
