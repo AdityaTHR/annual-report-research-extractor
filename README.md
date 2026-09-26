@@ -1,3 +1,5 @@
+https://annual-report-research-extractor-yemu4nkbsxbwzmtxtar4sa.streamlit.app/
+
 # FINAL V15 — lean production package
 
 This package freezes the validated V14 structural engine and keeps V15 additive only: conservative packaging, selective page-quality QA, and MDA research-unit exports. It contains no company/year/page-specific production rules. Page-quality OCR is lazy: the PDF is reopened only when a non-OCR page is actually flagged as suspicious.
