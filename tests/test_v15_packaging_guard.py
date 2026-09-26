@@ -304,3 +304,58 @@ test_v15_5_long_form_stops_at_auditor_report()
 test_v15_5_recovers_chief_executive_review_and_repairs_leadership()
 test_v15_5_csr_stops_at_new_top_level_awards_page()
 print('V15.5 generic boundary hardening: PASS')
+
+
+def test_v15_6_plain_prefix_auditor_and_adjacent_brr_start():
+    """Regression for older reports where layout order puts BRR title on the
+    prior page and the following auditor title is plain/native text, not tagged
+    as a layout heading."""
+    from section_guard_v15 import repair_nested_boundaries
+    pages=[
+        _pg(1,["Corporate governance body"]),
+        _pg(2,["Earlier content", "BUSINESS RESPONSIBILITY REPORT", "Section A: General Information about the Company"]),
+        _pg(3,["BRR body"]),
+        _pg(4,["BRR body"]),
+        _pg(5,["78 Independent Auditor’s Report", "To the Members of Example Limited", "Audit body"]),
+        _pg(6,["Audit continuation"]),
+    ]
+    sections={
+        "Business Responsibility Report (BRR)":{
+            **P(3,6),
+            "original_heading":"BUSINESS RESPONSIBILITY REPORT",
+            "canonical_category":"Business Responsibility Report (BRR)",
+            "text":"brR",
+            "raw_text":"brR",
+        }
+    }
+    kept,audit=repair_nested_boundaries(sections,pages,pages)
+    brr=kept["Business Responsibility Report (BRR)"]
+    assert (brr["start_page"],brr["end_page"]) == (2,4), (brr, audit)
+    assert any(r.get("reason") == "PAGE_PREFIX_Independent Auditor's Report" for r in audit), audit
+
+
+def test_v15_6_does_not_use_body_auditor_mention_as_boundary():
+    from section_guard_v15 import repair_nested_boundaries
+    pages=[
+        _pg(1,["Business Responsibility Report"]),
+        _pg(2,["BRR body", "The independent auditor's report is available elsewhere."]),
+        _pg(3,["BRR body continues"]),
+        _pg(4,["Independent Auditor's Report", "To the Members", "Audit body"]),
+    ]
+    sections={
+        "Business Responsibility Report (BRR)":{
+            **P(1,4),
+            "original_heading":"Business Responsibility Report",
+            "canonical_category":"Business Responsibility Report (BRR)",
+            "text":"brR",
+            "raw_text":"brR",
+        }
+    }
+    kept,audit=repair_nested_boundaries(sections,pages,pages)
+    brr=kept["Business Responsibility Report (BRR)"]
+    assert (brr["start_page"],brr["end_page"]) == (1,3), (brr, audit)
+
+
+test_v15_6_plain_prefix_auditor_and_adjacent_brr_start()
+test_v15_6_does_not_use_body_auditor_mention_as_boundary()
+print('V15.6 adjacent-title + plain-prefix terminator guards: PASS')

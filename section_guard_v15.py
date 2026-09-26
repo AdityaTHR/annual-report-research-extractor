@@ -1,4 +1,4 @@
-"""V15.5 additive section packaging and boundary guard.
+"""V15.6 additive section packaging and boundary guard.
 
 The validated V14 engine remains authoritative for detection and its existing
 boundaries. This module never changes extractor.py or semantic_v14.py. It only:
@@ -15,7 +15,7 @@ import re
 
 import extractor as core
 
-V15_PACKAGING_SCHEMA = "v15.5-section-packaging-guard-5"
+V15_PACKAGING_SCHEMA = "v15.6-section-packaging-guard-6"
 
 _RESPONSIBILITY_PRIORITY = {
     "Business Responsibility & Sustainability Report (BRSR)": 4,
@@ -505,6 +505,39 @@ _LONG_FORM_TERMINATOR_SECTIONS = {
     "Sustainability Report",
 }
 
+
+
+_LONG_FORM_EXACT_START_PATTERNS = {
+    "Corporate Social Responsibility": (
+        re.compile(r"(?i)^corporate\s+social\s+responsibility$"),
+        re.compile(r"(?i)^annual\s+report\s+on\s+(?:csr|corporate\s+social\s+responsibility)\s+activities?\d*$"),
+    ),
+    "Business Responsibility Report (BRR)": (
+        re.compile(r"(?i)^business\s+responsibility\s+report(?:\s*\(.*?\))?$"),
+    ),
+    "Business Responsibility & Sustainability Report (BRSR)": (
+        re.compile(r"(?i)^business\s+responsibility\s+(?:and|&)\s+sustainability\s+report(?:\s*\(.*?\))?$"),
+    ),
+    "ESG Report": (
+        re.compile(r"(?i)^(?:environmental,?\s*social\s*(?:and|&)\s*governance|esg)(?:\s+report)?$"),
+    ),
+    "Sustainability Report": (
+        re.compile(r"(?i)^sustainability\s+report$"),
+    ),
+}
+
+_PAGE_PREFIX_TERMINATORS = (
+    ("Independent Auditor's Report", re.compile(
+        r"(?i)^(?:\d+\s+)?independent\s+auditor(?:s|[’']s)?[’']?\s+report(?:\s+to\b.*)?$"
+    )),
+    ("Auditor's Report", re.compile(
+        r"(?i)^(?:\d+\s+)?auditor(?:s|[’']s)?[’']?\s+report(?:\s+to\b.*)?$"
+    )),
+    ("Financial Statements", re.compile(
+        r"(?i)^(?:\d+\s+)?(?:standalone\s+|consolidated\s+)?financial\s+statements?$"
+    )),
+)
+
 _STRONG_TOP_LEVEL_TERMINATORS = (
     ("Independent Auditor's Report", re.compile(
         r"(?i)^independent\s+auditor(?:s|[’']s)?[’']?\s+report$"
@@ -592,6 +625,89 @@ def _is_strong_page_title(page, line, text):
         if first_line is not line and _compact(first_text) != _compact(text):
             return False
     return True
+
+
+
+
+def _exact_long_form_anchor_on_page(pages, page_num, label):
+    """Recover a long-form report title on an immediately adjacent page.
+
+    This is deliberately exact-title only. It addresses PDF reading-order/layout
+    cases where the visible report title is emitted late on the correct page and
+    V14 consequently starts the packaged section one page too late.
+    """
+    patterns = _LONG_FORM_EXACT_START_PATTERNS.get(label)
+    if not patterns:
+        return None
+    idx = int(page_num) - 1
+    if idx < 0 or idx >= len(pages):
+        return None
+    candidates = []
+    for line in pages[idx].get("lines", []) or []:
+        text = _plain_semantic_text(core._norm_line(line.get("text", ""))).replace("’", "'")
+        if not text or len(text) > 180:
+            continue
+        if any(pat.match(text) for pat in patterns):
+            candidates.append((_line_order(line), line, text))
+    if not candidates:
+        return None
+    order, line, text = min(candidates, key=lambda x: x[0])
+    anchor = {
+        "index": idx,
+        "pdf_page": pages[idx].get("page") or page_num,
+        "line_order": order,
+        "bbox": line.get("bbox"),
+        "matched_text": text,
+        "matched_alias": text,
+        "label": label,
+        "score": 93,
+        "detection_source": "v15.6-adjacent-exact-title",
+    }
+    pp = _printed_page_for_anchor(pages[idx], anchor)
+    if pp is not None:
+        anchor["printed_page"] = pp
+    return anchor
+
+
+def _page_prefix_terminator_anchor(pages, start_page, end_page, current_label=None):
+    """Fallback for unmistakable report titles when layout metadata is weak.
+
+    We only inspect the first 12 non-empty extracted lines of each page and only
+    accept a very small exact-title vocabulary. This catches pages such as
+    ``78 Independent Auditor's Report`` without turning body mentions into
+    section boundaries.
+    """
+    first = max(0, int(start_page))
+    last = min(len(pages) - 1, int(end_page) - 1)
+    for idx in range(first, last + 1):
+        page = pages[idx]
+        seen = 0
+        for line in sorted(page.get("lines", []) or [], key=_line_order):
+            text = _plain_semantic_text(core._norm_line(line.get("text", ""))).replace("’", "'")
+            if not text:
+                continue
+            seen += 1
+            if seen > 12:
+                break
+            for label, pattern in _PAGE_PREFIX_TERMINATORS:
+                if current_label and label == current_label:
+                    continue
+                if pattern.match(text):
+                    anchor = {
+                        "index": idx,
+                        "pdf_page": page.get("page") or idx + 1,
+                        "line_order": _line_order(line),
+                        "bbox": line.get("bbox"),
+                        "matched_text": text,
+                        "label": label,
+                        "score": 95,
+                        "detection_source": "v15.6-page-prefix-terminator",
+                    }
+                    pp = _printed_page_for_anchor(page, anchor)
+                    if pp is not None:
+                        anchor["printed_page"] = pp
+                    return anchor
+    return None
 
 
 def _find_strong_top_level_terminator(pages, start_page, end_page, current_label=None):
@@ -899,7 +1015,9 @@ def _repair_long_form_terminators(sections, raw_pages, clean_pages):
             clean_pages, cr[0], cr[1], current_label=label
         )
         if boundary is None:
-            continue
+            boundary = _page_prefix_terminator_anchor(
+                clean_pages, cr[0], cr[1], current_label=label
+            )
 
         original_heading = payload.get("original_heading") or label
         start_anchor = _anchor_for_heading_on_page(
@@ -909,22 +1027,42 @@ def _repair_long_form_terminators(sections, raw_pages, clean_pages):
             start_anchor = _anchor_for_heading_on_page(
                 clean_pages, cr[0], label, payload.get("printed_start_page")
             )
-        if start_anchor is None:
+
+        # V15.6: if an exact long-form title exists on the immediately previous
+        # physical page, prefer it. This is a narrowly-scoped correction for
+        # reading-order/layout cases that shift the packaged start by one page.
+        if cr[0] > 1:
+            prev_anchor = _exact_long_form_anchor_on_page(clean_pages, cr[0] - 1, label)
+            if prev_anchor is not None:
+                start_anchor = prev_anchor
+
+        if start_anchor is None or boundary is None:
             continue
 
         repaired = core._payload_from_anchors(raw_pages, clean_pages, start_anchor, boundary)
         rr = _rng(repaired) if repaired else None
-        if not repaired or not rr or rr[0] != cr[0] or rr[1] >= cr[1]:
+        if not repaired or not rr:
+            continue
+        if rr[0] not in (cr[0], cr[0] - 1):
+            continue
+        if rr[1] > cr[1]:
+            continue
+        if rr == cr:
             continue
 
         repaired = _merge_repaired_payload(payload, repaired)
         kept[label] = repaired
+        reason_prefix = (
+            "PAGE_PREFIX"
+            if boundary.get("detection_source") == "v15.6-page-prefix-terminator"
+            else "STRONG_TOP_LEVEL"
+        )
         audit.append({
             "section": label,
             "start_page": rr[0],
             "end_page": rr[1],
             "action": "REPAIRED_BOUNDARY",
-            "reason": f"STRONG_TOP_LEVEL_{boundary.get('label')}",
+            "reason": f"{reason_prefix}_{boundary.get('label')}",
         })
     return kept, audit
 

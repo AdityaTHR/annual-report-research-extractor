@@ -1,5 +1,3 @@
-https://annual-report-research-extractor-yemu4nkbsxbwzmtxtar4sa.streamlit.app/
-
 # FINAL V15 — lean production package
 
 This package freezes the validated V14 structural engine and keeps V15 additive only: conservative packaging, selective page-quality QA, and MDA research-unit exports. It contains no company/year/page-specific production rules. Page-quality OCR is lazy: the PDF is reopened only when a non-OCR page is actually flagged as suspicious.
@@ -114,3 +112,12 @@ V15.5 keeps the frozen V14 structural engine unchanged. The additive packaging l
 - retains the V15.4 statutory-CSR and real-layout safeguards.
 
 These rules are generic category/visual-structure rules only. There are no company names, years, or fixed page numbers in production logic.
+
+### V15.6 generic long-form boundary hardening
+
+V15.6 adds two narrowly-scoped, layout-robust fallbacks for older annual reports:
+
+- if an exact long-form report title (BRR/BRSR/CSR/ESG/Sustainability) is found on the immediately preceding physical page, the packaged start may be shifted back by one page; and
+- an unmistakable Auditor/Financial-Statements title appearing in the first 12 extracted lines of a page can terminate an overlong responsibility/sustainability section even when the layout engine did not classify that line as a heading.
+
+The fallback is exact-title and page-prefix constrained. Body mentions do not qualify.
