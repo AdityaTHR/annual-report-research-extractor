@@ -220,3 +220,87 @@ def test_v15_4_layout_heading_uses_native_style_duplicate():
 test_v15_4_csr_wrapper_geometry_and_markup()
 test_v15_4_layout_heading_uses_native_style_duplicate()
 print('V15.4 real-layout CSR guards: PASS')
+
+
+def test_v15_5_long_form_stops_at_auditor_report():
+    from section_guard_v15 import repair_nested_boundaries
+    pages=[
+        _pg(1,["Business Responsibility Report"]),
+        _pg(2,["BRR body"]),
+        _pg(3,["BRR body"]),
+        _pg(4,[{"text":"Independent Auditor’s Report","layout_class":"section-header","bbox":[50,70,330,92],"bold":True}, "Audit body"]),
+        _pg(5,["Financial statements"]),
+    ]
+    sections={
+        "Business Responsibility Report (BRR)":{
+            **P(1,5),
+            "original_heading":"Business Responsibility Report",
+            "canonical_category":"Business Responsibility Report (BRR)",
+            "text":"brR",
+            "raw_text":"brR",
+        }
+    }
+    kept,audit=repair_nested_boundaries(sections,pages,pages)
+    brr=kept["Business Responsibility Report (BRR)"]
+    assert (brr["start_page"],brr["end_page"]) == (1,3)
+    assert any("Independent Auditor's Report" in r.get("reason","") for r in audit)
+
+
+def test_v15_5_recovers_chief_executive_review_and_repairs_leadership():
+    from section_guard_v15 import repair_nested_boundaries
+    top={"size":20.0,"font":"Corp-Bold","bold":True,"bbox":[50,70,300,95]}
+    pages=[
+        _pg(1,[{"text":"Chairman’s Message","layout_class":"section-header","bbox":[50,70,300,95],"size":None,"font":None,"bold":True},
+               {**top,"text":"Chairman’s Message","layout_class":"folio-edge"},"Chairman body"]),
+        _pg(2,["Chairman continuation"]),
+        _pg(3,[{"text":"Chief Executive’s Review","layout_class":"section-header","bbox":[50,70,320,95],"size":None,"font":None,"bold":True},
+               {**top,"text":"Chief Executive’s Review","layout_class":"folio-edge"},"CEO body"]),
+        _pg(4,["CEO continuation"]),
+        _pg(5,[{**top,"text":"Operating Environment","layout_class":"folio-edge"},"Next chapter"]),
+    ]
+    sections={
+        "Chairman Message":{
+            **P(1,5),
+            "original_heading":"Chairman’s Message",
+            "canonical_category":"Chairman Message",
+            "text":"chair",
+            "raw_text":"chair",
+        }
+    }
+    kept,audit=repair_nested_boundaries(sections,pages,pages)
+    assert (kept["Chairman Message"]["start_page"],kept["Chairman Message"]["end_page"]) == (1,2)
+    assert "CEO Message" in kept
+    assert (kept["CEO Message"]["start_page"],kept["CEO Message"]["end_page"]) == (3,4)
+    assert any(r.get("action") == "RECOVERED_LEADERSHIP_VARIANT" for r in audit)
+
+
+def test_v15_5_csr_stops_at_new_top_level_awards_page():
+    from section_guard_v15 import repair_nested_boundaries
+    pages=[
+        _pg(1,[
+            {"text":"Corporate Social Responsibility","layout_class":"section-header","bbox":[50,70,330,92],"size":20.0,"font":"Corp-Bold","bold":True},
+            {"text":"CSR body","layout_class":"text","bbox":[50,140,500,300],"size":None,"font":None},
+        ]),
+        _pg(2,[{"text":"CSR continuation","layout_class":"text","bbox":[50,80,500,300],"size":None,"font":None}]),
+        _pg(3,[{"text":"Awards and Recognitions","layout_class":"section-header","bbox":[50,80,250,100],"size":18.0,"font":"Corp-Bold","bold":True},"Awards body"]),
+        _pg(4,["Board of Directors"]),
+    ]
+    sections={
+        "Corporate Social Responsibility":{
+            **P(1,3),
+            "original_heading":"Corporate Social Responsibility",
+            "canonical_category":"Corporate Social Responsibility",
+            "text":"csr",
+            "raw_text":"csr",
+        }
+    }
+    kept,audit=repair_nested_boundaries(sections,pages,pages)
+    csr=kept["Corporate Social Responsibility"]
+    assert (csr["start_page"],csr["end_page"]) == (1,2)
+    assert any(r.get("reason") == "STRONG_TOP_LEVEL_Awards and Recognitions" for r in audit)
+
+
+test_v15_5_long_form_stops_at_auditor_report()
+test_v15_5_recovers_chief_executive_review_and_repairs_leadership()
+test_v15_5_csr_stops_at_new_top_level_awards_page()
+print('V15.5 generic boundary hardening: PASS')

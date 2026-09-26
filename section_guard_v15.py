@@ -1,4 +1,4 @@
-"""V15.3 additive section packaging and nested-boundary guard.
+"""V15.5 additive section packaging and boundary guard.
 
 The validated V14 engine remains authoritative for detection and its existing
 boundaries. This module never changes extractor.py or semantic_v14.py. It only:
@@ -15,7 +15,7 @@ import re
 
 import extractor as core
 
-V15_PACKAGING_SCHEMA = "v15.4-section-packaging-guard-4"
+V15_PACKAGING_SCHEMA = "v15.5-section-packaging-guard-5"
 
 _RESPONSIBILITY_PRIORITY = {
     "Business Responsibility & Sustainability Report (BRSR)": 4,
@@ -467,6 +467,469 @@ def _merge_repaired_payload(original, repaired):
     return repaired
 
 
+
+# V15.5 generic hardening.
+#
+# These rules are intentionally category-level rather than company/year-specific:
+# - long-form responsibility/CSR sections stop at a new, strong top-level report;
+# - common leadership-title variants can be recovered without changing V14;
+# - leadership messages are repackaged to the next peer/top-level title rather
+#   than being cut at an early signature line.
+
+_LEADERSHIP_TITLE_PATTERNS = {
+    "Chairman Message": re.compile(
+        r"(?i)^(?:message|letter|statement|review|address)\s+from\s+(?:the\s+)?(?:executive\s+)?chair(?:man|person)"
+        r"|^(?:executive\s+)?chair(?:man|person)(?:'s|s)?\s+(?:message|letter|statement|review|address)$"
+    ),
+    "CEO Message": re.compile(
+        r"(?i)^(?:message|letter|statement|review|address)\s+from\s+(?:the\s+)?(?:chief\s+executive(?:\s+officer)?|ceo)"
+        r"|^(?:chief\s+executive(?:\s+officer)?|ceo)(?:'s|s)?\s+(?:message|letter|statement|review|address)$"
+    ),
+    "Managing Director Message": re.compile(
+        r"(?i)^(?:message|letter|statement|review|address)\s+from\s+(?:the\s+)?(?:managing\s+director|md)"
+        r"|^(?:managing\s+director|md)(?:'s|s)?\s+(?:message|letter|statement|review|address)$"
+    ),
+}
+
+_LEADERSHIP_ROLE_PATTERNS = {
+    "Chairman Message": re.compile(r"(?i)\b(?:executive\s+)?chair(?:man|person)\b"),
+    "CEO Message": re.compile(r"(?i)\b(?:chief\s+executive\s+officer|ceo)\b"),
+    "Managing Director Message": re.compile(r"(?i)\b(?:managing\s+director|whole[-\s]?time\s+director|\bmd\b)\b"),
+}
+
+_LONG_FORM_TERMINATOR_SECTIONS = {
+    "Corporate Social Responsibility",
+    "Business Responsibility Report (BRR)",
+    "Business Responsibility & Sustainability Report (BRSR)",
+    "ESG Report",
+    "Sustainability Report",
+}
+
+_STRONG_TOP_LEVEL_TERMINATORS = (
+    ("Independent Auditor's Report", re.compile(
+        r"(?i)^independent\s+auditor(?:s|[’']s)?[’']?\s+report$"
+    )),
+    ("Auditor's Report", re.compile(
+        r"(?i)^auditor(?:s|[’']s)?[’']?\s+report$"
+    )),
+    ("Financial Statements", re.compile(
+        r"(?i)^(?:standalone\s+|consolidated\s+)?financial\s+statements?$"
+    )),
+    ("Board of Directors", re.compile(
+        r"(?i)^board\s+of\s+directors$"
+    )),
+    ("Board's Report", re.compile(
+        r"(?i)^board(?:'s|s')\s+report$"
+    )),
+    ("Directors' Report", re.compile(
+        r"(?i)^directors?'?\s+report$"
+    )),
+    ("Corporate Governance Report", re.compile(
+        r"(?i)^corporate\s+governance(?:\s+report)?$"
+    )),
+    ("Management Discussion & Analysis", re.compile(
+        r"(?i)^management(?:'s)?\s+(?:discussion|review)\s*(?:and|&)\s*analysis(?:\s+report)?$"
+    )),
+    ("Business Responsibility Report", re.compile(
+        r"(?i)^business\s+responsibility(?:\s+and\s+sustainability)?\s+report(?:\s*\(.*?\))?$"
+    )),
+    ("ESG Report", re.compile(
+        r"(?i)^(?:environmental,\s*social\s*(?:and|&)\s*governance|esg)(?:\s+report)?$"
+    )),
+    ("Sustainability Report", re.compile(
+        r"(?i)^sustainability\s+report$"
+    )),
+    ("Awards and Recognitions", re.compile(
+        r"(?i)^awards?\s*(?:and|&)\s*recognitions?$"
+    )),
+    ("Notice", re.compile(
+        r"(?i)^notice$"
+    )),
+)
+
+
+def _line_top_fraction(page, line):
+    bb = line.get("bbox")
+    h = float(page.get("height") or 0)
+    if not h or not isinstance(bb, (list, tuple)) or len(bb) < 4:
+        return None
+    return float(bb[1]) / h
+
+
+def _first_structural_heading(page):
+    """Return the first credible heading-like line in visual/page order."""
+    candidates = []
+    for line in page.get("lines", []) or []:
+        text = core._norm_line(line.get("text", ""))
+        if not text or len(text) > 220:
+            continue
+        layout = str(line.get("layout_class") or "").lower()
+        if "section" not in layout and "heading" not in layout:
+            continue
+        bb = line.get("bbox")
+        y = float(bb[1]) if isinstance(bb, (list, tuple)) and len(bb) >= 4 else 1e9
+        candidates.append((y, _line_order(line), line, text))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda x: (x[0], x[1]))[2:]
+
+
+def _is_strong_page_title(page, line, text):
+    """Require evidence appropriate for a peer/top-level report boundary."""
+    if not _is_heading_evidence(page, line, text, require_page_top=True):
+        return False
+
+    frac = _line_top_fraction(page, line)
+    if frac is not None and frac > 0.30:
+        return False
+
+    # If layout reconstruction provides section headings, require this candidate
+    # to be the first such heading on the page. This rejects most internal
+    # subsections while retaining genuine new report/page titles.
+    first = _first_structural_heading(page)
+    if first is not None:
+        first_line, first_text = first
+        if first_line is not line and _compact(first_text) != _compact(text):
+            return False
+    return True
+
+
+def _find_strong_top_level_terminator(pages, start_page, end_page, current_label=None):
+    """Find a strong new peer report inside an existing overlong range."""
+    first = max(0, int(start_page))  # page after section start
+    last = min(len(pages) - 1, int(end_page) - 1)
+    for idx in range(first, last + 1):
+        page = pages[idx]
+        for line in sorted(page.get("lines", []) or [], key=_line_order):
+            text = _plain_semantic_text(core._norm_line(line.get("text", "")))
+            if not text or len(text) > 180:
+                continue
+            for label, pattern in _STRONG_TOP_LEVEL_TERMINATORS:
+                if current_label and label == current_label:
+                    continue
+                if pattern.match(text) and _is_strong_page_title(page, line, text):
+                    anchor = {
+                        "index": idx,
+                        "pdf_page": page.get("page") or idx + 1,
+                        "line_order": _line_order(line),
+                        "bbox": line.get("bbox"),
+                        "matched_text": text,
+                        "label": label,
+                        "score": 92,
+                        "detection_source": "v15.5-strong-top-level-terminator",
+                    }
+                    pp = _printed_page_for_anchor(page, anchor)
+                    if pp is not None:
+                        anchor["printed_page"] = pp
+                    return anchor
+    return None
+
+
+def _leadership_candidate_anchor(pages, label):
+    """Recover exact leadership-title variants using strong page-title evidence."""
+    pattern = _LEADERSHIP_TITLE_PATTERNS.get(label)
+    if pattern is None:
+        return None
+    candidates = []
+    for idx, page in enumerate(pages):
+        for line in page.get("lines", []) or []:
+            text = _plain_semantic_text(core._norm_line(line.get("text", ""))).replace("’", "'")
+            if not text or len(text) > 150 or not pattern.match(text):
+                continue
+
+            layout = str(line.get("layout_class") or "").lower()
+            frac = _line_top_fraction(page, line)
+            size = float(line.get("size") or 0)
+            strong = (
+                "section" in layout
+                or "heading" in layout
+                or (frac is not None and frac <= 0.25 and (bool(line.get("bold")) or size >= 9.0))
+            )
+            if not strong:
+                continue
+
+            # Enrich style from a duplicate native/layout line when available.
+            style_line = line
+            if not line.get("size"):
+                same = [
+                    ln for ln in page.get("lines", []) or []
+                    if _compact(ln.get("text", "")) == _compact(text) and ln.get("size")
+                ]
+                if same:
+                    style_line = max(same, key=lambda ln: float(ln.get("size") or 0))
+
+            anchor = {
+                "index": idx,
+                "pdf_page": page.get("page") or idx + 1,
+                "line_order": _line_order(line),
+                "bbox": line.get("bbox"),
+                "matched_text": text,
+                "matched_alias": text,
+                "label": label,
+                "score": 94,
+                "detection_source": "v15.5-leadership-title",
+                "size": style_line.get("size"),
+                "font": style_line.get("font"),
+                "bold": style_line.get("bold", line.get("bold")),
+                "layout_class": line.get("layout_class"),
+            }
+            pp = _printed_page_for_anchor(page, anchor)
+            if pp is not None:
+                anchor["printed_page"] = pp
+            candidates.append(anchor)
+
+    return min(candidates, key=lambda a: (a["index"], a.get("line_order", 0))) if candidates else None
+
+
+def _find_same_style_peer_boundary(pages, start_anchor, max_pages=12):
+    start_idx = int(start_anchor["index"])
+    last = min(len(pages) - 1, start_idx + max_pages)
+    for idx in range(start_idx + 1, last + 1):
+        page = pages[idx]
+        for line in sorted(page.get("lines", []) or [], key=_line_order):
+            text = core._norm_line(line.get("text", ""))
+            if not text or len(text) > 140:
+                continue
+            style_match = _same_chapter_heading_style(start_anchor, page, line, text)
+            if not style_match:
+                # Leadership page titles are sometimes emitted only as folio-edge
+                # native lines. Permit those only with very strong typography:
+                # same title band, same font size/font/weight, and a substantial
+                # title size. This is narrower than the generic sibling matcher.
+                sb = start_anchor.get("bbox")
+                lb = line.get("bbox")
+                try:
+                    ss = float(start_anchor.get("size") or 0)
+                    ls = float(line.get("size") or 0)
+                except Exception:
+                    ss = ls = 0
+                sfont = str(start_anchor.get("font") or "").strip().lower()
+                lfont = str(line.get("font") or "").strip().lower()
+                style_match = bool(
+                    ss >= 14 and ls >= 14 and abs(ss - ls) <= 0.35
+                    and isinstance(sb, (list, tuple)) and len(sb) >= 4
+                    and isinstance(lb, (list, tuple)) and len(lb) >= 4
+                    and abs(float(lb[1]) - float(sb[1])) <= 24
+                    and (not sfont or not lfont or sfont == lfont)
+                    and bool(start_anchor.get("bold")) == bool(line.get("bold"))
+                    and _compact(text) != _compact(start_anchor.get("matched_text", ""))
+                    and 1 <= len(re.findall(r"[A-Za-z]+", text)) <= 10
+                )
+            if style_match:
+                # Same-style peer must also occupy the page-title band.
+                frac = _line_top_fraction(page, line)
+                if frac is not None and frac > 0.30:
+                    continue
+                anchor = {
+                    "index": idx,
+                    "pdf_page": page.get("page") or idx + 1,
+                    "line_order": _line_order(line),
+                    "bbox": line.get("bbox"),
+                    "matched_text": text,
+                    "label": text,
+                    "score": 90,
+                    "detection_source": "v15.5-leadership-style-peer",
+                }
+                pp = _printed_page_for_anchor(page, anchor)
+                if pp is not None:
+                    anchor["printed_page"] = pp
+                return anchor
+    return None
+
+
+def _find_late_signature_boundary(pages, start_anchor, label, max_pages=8):
+    """Fallback for leadership reviews whose next page title uses another style.
+
+    We only use a role-bearing signature on a page *after* the start page and in
+    the lower half of the page. This avoids the common layout where a signature
+    is printed on page 1 while the message continues onto page 2.
+    """
+    pattern = _LEADERSHIP_ROLE_PATTERNS.get(label)
+    if pattern is None:
+        return None
+    start_idx = int(start_anchor["index"])
+    last = min(len(pages) - 1, start_idx + max_pages)
+    signature_idx = None
+
+    for idx in range(start_idx + 1, last + 1):
+        page = pages[idx]
+        h = float(page.get("height") or 0)
+        for line in page.get("lines", []) or []:
+            text = core._norm_line(line.get("text", ""))
+            if not text or not pattern.search(text):
+                continue
+            bb = line.get("bbox")
+            if h and isinstance(bb, (list, tuple)) and len(bb) >= 4:
+                if float(bb[1]) < 0.52 * h:
+                    continue
+            else:
+                if _line_order(line) < 8:
+                    continue
+            signature_idx = idx
+
+    if signature_idx is None or signature_idx + 1 >= len(pages):
+        return None
+
+    ni = signature_idx + 1
+    return {
+        "index": ni,
+        "pdf_page": pages[ni].get("page") or ni + 1,
+        "line_order": 0,
+        "bbox": None,
+        "matched_text": "Leadership signature end",
+        "label": "Leadership signature end",
+        "score": 88,
+        "detection_source": "v15.5-late-signature-end",
+    }
+
+
+def _repair_leadership_sections(sections, raw_pages, clean_pages):
+    kept = deepcopy(sections)
+    audit = []
+
+    # Recover exact leadership-title variants that V14 did not package.
+    anchors = {}
+    for label in _LEADERSHIP_TITLE_PATTERNS:
+        payload = kept.get(label)
+        if payload and _rng(payload):
+            heading = payload.get("original_heading") or label
+            anchor = _anchor_for_heading_on_page(
+                clean_pages, _rng(payload)[0], heading, payload.get("printed_start_page")
+            )
+            if anchor is None and heading != label:
+                anchor = _anchor_for_heading_on_page(
+                    clean_pages, _rng(payload)[0], label, payload.get("printed_start_page")
+                )
+        else:
+            anchor = _leadership_candidate_anchor(clean_pages, label)
+        if anchor is not None:
+            anchors[label] = anchor
+
+    # Add missing categories only from exact title variants.
+    for label, anchor in anchors.items():
+        if label in kept:
+            continue
+        kept[label] = {
+            "start_page": anchor["pdf_page"],
+            "end_page": anchor["pdf_page"],
+            "text": "",
+            "raw_text": "",
+            "original_heading": anchor.get("matched_text") or label,
+            "canonical_category": label,
+            "semantic_confidence": "HIGH",
+            "semantic_match_type": "V15_5_LEADERSHIP_VARIANT",
+        }
+        audit.append({
+            "section": label,
+            "start_page": anchor["pdf_page"],
+            "end_page": anchor["pdf_page"],
+            "action": "RECOVERED_LEADERSHIP_VARIANT",
+            "reason": anchor.get("matched_text") or label,
+        })
+
+    # Repackage each leadership message to the strongest next peer boundary.
+    starts = sorted(
+        (a["index"], label, a)
+        for label, a in anchors.items()
+        if label in kept and not _is_manual(kept[label])
+    )
+
+    for _, label, start_anchor in starts:
+        payload = kept.get(label)
+        if not payload:
+            continue
+        cr = _rng(payload)
+
+        next_leader = None
+        for idx2, label2, anchor2 in starts:
+            if idx2 > start_anchor["index"]:
+                next_leader = anchor2
+                break
+
+        style_peer = _find_same_style_peer_boundary(clean_pages, start_anchor)
+        signature_boundary = _find_late_signature_boundary(clean_pages, start_anchor, label)
+
+        boundary_candidates = [
+            a for a in (next_leader, style_peer, signature_boundary)
+            if a is not None and a["index"] > start_anchor["index"]
+        ]
+        if not boundary_candidates:
+            continue
+        boundary = min(boundary_candidates, key=lambda a: (a["index"], a.get("line_order", 0)))
+
+        repaired = core._payload_from_anchors(raw_pages, clean_pages, start_anchor, boundary)
+        rr = _rng(repaired) if repaired else None
+        if not repaired or not rr:
+            continue
+
+        old = cr
+        if old == rr:
+            continue
+
+        repaired = _merge_repaired_payload(payload, repaired)
+        repaired["original_heading"] = payload.get("original_heading") or start_anchor.get("matched_text") or label
+        repaired["canonical_category"] = payload.get("canonical_category") or label
+        repaired["semantic_confidence"] = payload.get("semantic_confidence") or "HIGH"
+        repaired["semantic_match_type"] = payload.get("semantic_match_type") or "V15_5_LEADERSHIP_VARIANT"
+        kept[label] = repaired
+
+        audit.append({
+            "section": label,
+            "start_page": rr[0],
+            "end_page": rr[1],
+            "action": "REPAIRED_LEADERSHIP_BOUNDARY",
+            "reason": f"NEXT_PEER_{boundary.get('label')}",
+        })
+
+    return kept, audit
+
+
+def _repair_long_form_terminators(sections, raw_pages, clean_pages):
+    kept = deepcopy(sections)
+    audit = []
+    for label in _LONG_FORM_TERMINATOR_SECTIONS:
+        payload = kept.get(label)
+        if not payload or _is_manual(payload):
+            continue
+        cr = _rng(payload)
+        if not cr or cr[1] <= cr[0]:
+            continue
+
+        boundary = _find_strong_top_level_terminator(
+            clean_pages, cr[0], cr[1], current_label=label
+        )
+        if boundary is None:
+            continue
+
+        original_heading = payload.get("original_heading") or label
+        start_anchor = _anchor_for_heading_on_page(
+            clean_pages, cr[0], original_heading, payload.get("printed_start_page")
+        )
+        if start_anchor is None and original_heading != label:
+            start_anchor = _anchor_for_heading_on_page(
+                clean_pages, cr[0], label, payload.get("printed_start_page")
+            )
+        if start_anchor is None:
+            continue
+
+        repaired = core._payload_from_anchors(raw_pages, clean_pages, start_anchor, boundary)
+        rr = _rng(repaired) if repaired else None
+        if not repaired or not rr or rr[0] != cr[0] or rr[1] >= cr[1]:
+            continue
+
+        repaired = _merge_repaired_payload(payload, repaired)
+        kept[label] = repaired
+        audit.append({
+            "section": label,
+            "start_page": rr[0],
+            "end_page": rr[1],
+            "action": "REPAIRED_BOUNDARY",
+            "reason": f"STRONG_TOP_LEVEL_{boundary.get('label')}",
+        })
+    return kept, audit
+
+
+
 def repair_nested_boundaries(sections, raw_pages, clean_pages):
     """Recover / repair CSR boundaries using only strong structural evidence.
 
@@ -481,12 +944,23 @@ def repair_nested_boundaries(sections, raw_pages, clean_pages):
     """
     kept = deepcopy(sections)
     audit = []
+
+    # V15.5 generic leadership recovery/repackaging first. Existing CSR
+    # statutory/style repair remains stronger; generic long-form terminators run
+    # afterwards so the same CSR range is not repaired twice.
+    kept, leadership_audit = _repair_leadership_sections(kept, raw_pages, clean_pages)
+    audit.extend(leadership_audit)
+
     label = "Corporate Social Responsibility"
     payload = kept.get(label)
     if not payload or _is_manual(payload):
+        kept, long_form_audit = _repair_long_form_terminators(kept, raw_pages, clean_pages)
+        audit.extend(long_form_audit)
         return kept, audit
     cr = _rng(payload)
     if not cr:
+        kept, long_form_audit = _repair_long_form_terminators(kept, raw_pages, clean_pages)
+        audit.extend(long_form_audit)
         return kept, audit
 
     # --- A. Statutory CSR annexure recovery inside Board/Directors report ---
@@ -518,7 +992,9 @@ def repair_nested_boundaries(sections, raw_pages, clean_pages):
                             "reason": f"CSR_ANNEXURE_INSIDE_{parent}",
                         })
                         # Once a statutory Annexure has been recovered, its next
-                        # Annexure wrapper is the strongest possible end boundary.
+                        # Annexure wrapper is the strongest possible CSR end boundary.
+                        kept, long_form_audit = _repair_long_form_terminators(kept, raw_pages, clean_pages)
+                        audit.extend(long_form_audit)
                         return kept, audit
 
     # --- B. Strong peer terminator inside an overlong narrative CSR section ---
@@ -546,6 +1022,8 @@ def repair_nested_boundaries(sections, raw_pages, clean_pages):
                     "reason": f"STRONG_PEER_{boundary.get('label')}",
                 })
 
+    kept, long_form_audit = _repair_long_form_terminators(kept, raw_pages, clean_pages)
+    audit.extend(long_form_audit)
     return kept, audit
 
 

@@ -103,3 +103,14 @@ V15.4 adds regression protection for layout quirks observed in the five-report i
 - Narrative CSR sibling-boundary matching enriches layout headings with duplicate native font metadata, preventing ordinary CSR subheadings from being mistaken for peer chapters while still detecting genuine peers such as `Responsible supply chain`.
 
 The frozen V14 detector and boundary engine remain unchanged.
+
+## V15.5 generic boundary hardening
+
+V15.5 keeps the frozen V14 structural engine unchanged. The additive packaging layer now:
+
+- stops overlong BRR/BRSR/CSR/ESG/Sustainability packages at a new strong top-level report heading (for example an Independent Auditor's Report or Financial Statements);
+- recognizes leadership title variants such as `Chief Executive's Review` as CEO-message candidates when V14 did not package them;
+- repackages leadership messages to the next strong peer/top-level title instead of cutting them at an early signature line;
+- retains the V15.4 statutory-CSR and real-layout safeguards.
+
+These rules are generic category/visual-structure rules only. There are no company names, years, or fixed page numbers in production logic.
