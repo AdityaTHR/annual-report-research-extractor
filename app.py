@@ -18,10 +18,19 @@ from semantic_v14 import (
     semantic_manifest_csv,
     semantic_manifest_json,
 )
+from quality_v15 import V15_QUALITY_SCHEMA, build_quality_pages, simple_quality_manifest
+from section_guard_v15 import V15_PACKAGING_SCHEMA, apply_packaging_guard, repair_nested_boundaries
+from mda_units_v15 import (
+    build_coverage_audit,
+    build_mda_page_rows,
+    build_paragraph_rows,
+    build_review_queue,
+    build_sentence_rows,
+)
 
 st.set_page_config(page_title="Annual Report Research Extractor", page_icon="📄", layout="wide")
 st.title("Annual Report Research Extractor")
-st.caption("V14 • automatic semantic section normalization • batch extraction • research-ready downloads")
+st.caption("V15 • validated V14 boundaries + page QA/provenance + MDA research datasets")
 
 
 def detect_sections(raw_pages, research_pages, leadership, mda, sustainability, custom_heads, include_low_structural=False, include_supplementary=False):
@@ -137,13 +146,33 @@ def _archive_section_folder(label, payload):
     return f"Sections/{safe_folder(canonical)}"
 
 
+def _rows_csv_bytes(rows):
+    rows = list(rows)
+    if not rows:
+        return b""
+    fields = []
+    seen = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    return out.getvalue().encode("utf-8-sig")
+
+
 def process_one(upload, formats, leadership, mda, sustainability, custom_heads, include_clean_pdf=False, include_low_structural=False, include_supplementary=False):
     raw = upload.getvalue()
-    raw_pages = extract_source_cached(upload.name, raw)
-    research_pages = clean_pages(raw_pages)
+
+    # V14 remains the authority for section detection and boundaries.
+    baseline_pages = extract_source_cached(upload.name, raw)
+    boundary_pages = clean_pages(baseline_pages)
     sections, semantic_manifest = detect_sections(
-        raw_pages,
-        research_pages,
+        baseline_pages,
+        boundary_pages,
         leadership,
         mda,
         sustainability,
@@ -151,18 +180,32 @@ def process_one(upload, formats, leadership, mda, sustainability, custom_heads, 
         include_low_structural=include_low_structural,
         include_supplementary=include_supplementary,
     )
+    sections, repair_audit = repair_nested_boundaries(sections, baseline_pages, boundary_pages)
+    sections, packaging_audit = apply_packaging_guard(sections)
+    packaging_audit = repair_audit + packaging_audit
+
+    # V15 audits the chosen page text independently. These pages are used only
+    # for downstream text analytics, never to rediscover V14 section boundaries.
+    source_is_pdf = upload.name.lower().endswith(".pdf")
+    if source_is_pdf:
+        analysis_pages, quality_rows = build_quality_pages(raw, baseline_pages)
+    else:
+        analysis_pages = baseline_pages
+        quality_rows = simple_quality_manifest(baseline_pages)
+    analysis_clean_pages = clean_pages(analysis_pages)
 
     stem = base_stem(upload.name)
-    meta = infer_metadata(upload.name, raw_pages)
+    meta = infer_metadata(upload.name, baseline_pages)
+    report_id = safe_folder(f"{meta['company']}_{meta['year']}_{stem}")
+
     full = {
-        "text": raw_full_text(raw_pages),
+        "text": raw_full_text(baseline_pages),
         "original_heading": "Full Report",
         "canonical_category": "Full Report",
         "semantic_confidence": "HIGH",
         "semantic_match_type": "SOURCE_DOCUMENT",
     }
     items = {"Full Report": full, **sections}
-    source_is_pdf = upload.name.lower().endswith(".pdf")
 
     generated = {}
     archive_files = {}
@@ -176,7 +219,7 @@ def process_one(upload, formats, leadership, mda, sustainability, custom_heads, 
                 label,
                 payload,
                 fmt,
-                raw_pages,
+                baseline_pages,
                 source_bytes=raw,
                 source_is_pdf=source_is_pdf,
                 all_sections=sections,
@@ -186,18 +229,69 @@ def process_one(upload, formats, leadership, mda, sustainability, custom_heads, 
             archive_files[archive_path] = data
             archive_lookup[label][fmt] = archive_path
 
+    # V15 page provenance / QA.
+    quality_csv = _rows_csv_bytes(quality_rows)
+    quality_summary = {
+        "NATIVE": sum(r.get("decision") == "NATIVE" for r in quality_rows),
+        "OCR": sum(r.get("decision") == "OCR" for r in quality_rows),
+        "REVIEW": sum(r.get("decision") == "REVIEW" for r in quality_rows),
+    }
+
+    # MDA research units use V14's fixed page range but the V15 quality-selected
+    # representation within that range.
+    quality_by_page = {
+        int(r["page"]): r for r in quality_rows
+        if str(r.get("page", "")).isdigit()
+    }
+    mda_page_rows, mda_payload = build_mda_page_rows(
+        report_id, analysis_clean_pages, sections, quality_by_page
+    )
+    mda_paragraph_rows = build_paragraph_rows(mda_page_rows)
+    mda_sentence_rows = build_sentence_rows(mda_paragraph_rows)
+    mda_review_rows = build_review_queue(mda_paragraph_rows)
+    mda_coverage_rows = build_coverage_audit(report_id, mda_page_rows, mda_payload)
+
+    mda_exports = {
+        "MDA_page_level.csv": _rows_csv_bytes(mda_page_rows),
+        "MDA_paragraph_level.csv": _rows_csv_bytes(mda_paragraph_rows),
+        "MDA_sentence_level.csv": _rows_csv_bytes(mda_sentence_rows),
+        "MDA_review_queue.csv": _rows_csv_bytes(mda_review_rows),
+        "MDA_coverage_audit.csv": _rows_csv_bytes(mda_coverage_rows),
+    }
+    for name, data in mda_exports.items():
+        archive_files[f"MDA_Research_Data/{name}"] = data
+
     # Traceability metadata is always included in ZIPs, independent of chosen text formats.
     sem_csv = semantic_manifest_csv(semantic_manifest)
     sem_json = semantic_manifest_json(semantic_manifest)
     report_meta = {
         **meta,
         "source_file": upload.name,
-        "page_count": len(raw_pages),
+        "page_count": len(baseline_pages),
         "v14_cache_schema": V14_CACHE_SCHEMA,
+        "v15_quality_schema": V15_QUALITY_SCHEMA,
+        "v15_packaging_schema": V15_PACKAGING_SCHEMA,
         "sections_extracted": len(sections),
+    }
+    qa_summary = {
+        "page_count": len(baseline_pages),
+        "page_quality_decisions": quality_summary,
+        "v14_cache_schema": V14_CACHE_SCHEMA,
+        "v15_quality_schema": V15_QUALITY_SCHEMA,
+        "boundary_engine": "V14 frozen structural engine",
+        "quality_layer_changes_boundaries": False,
+        "mda_found": bool(mda_payload),
+        "mda_page_rows": len(mda_page_rows),
+        "mda_paragraph_rows": len(mda_paragraph_rows),
+        "mda_sentence_rows": len(mda_sentence_rows),
     }
     archive_files["Metadata/semantic_heading_manifest.csv"] = sem_csv
     archive_files["Metadata/semantic_heading_manifest.json"] = sem_json
+    archive_files["Metadata/page_quality_manifest.csv"] = quality_csv
+    archive_files["Metadata/section_packaging_audit.csv"] = _rows_csv_bytes(packaging_audit)
+    archive_files["Metadata/QA_summary.json"] = json.dumps(
+        qa_summary, ensure_ascii=False, indent=2
+    ).encode("utf-8")
     archive_files["Metadata/report_metadata.json"] = json.dumps(
         report_meta, ensure_ascii=False, indent=2
     ).encode("utf-8")
@@ -208,12 +302,11 @@ def process_one(upload, formats, leadership, mda, sustainability, custom_heads, 
         generated[clean_name] = clean_data
         archive_files[f"PDF_Cleanup/{clean_name}"] = clean_data
 
-    page_count = len(raw_pages)
-    # Keep only page text for interactive search.  Full layout dictionaries can be
-    # very large and were causing unnecessary Streamlit session-memory pressure.
+    page_count = len(baseline_pages)
+    # Keep session memory light: only searchable text, not full layout dictionaries.
     search_pages_light = [
         {"page": p.get("page"), "text": p.get("text", "")}
-        for p in research_pages
+        for p in boundary_pages
     ]
 
     return {
@@ -226,6 +319,10 @@ def process_one(upload, formats, leadership, mda, sustainability, custom_heads, 
         "semantic_manifest": semantic_manifest,
         "semantic_manifest_csv": sem_csv,
         "semantic_manifest_json": sem_json,
+        "quality_manifest_csv": quality_csv,
+        "quality_summary": quality_summary,
+        "mda_exports": mda_exports,
+        "mda_coverage": mda_coverage_rows,
         "items": items,
         "files": generated,
         "archive_files": archive_files,
@@ -381,7 +478,7 @@ if mode == "Bulk Processing":
         "Bulk mode processes reports one by one and creates one structured ZIP with a folder for each company/year plus a master research_manifest.csv."
     )
     st.caption(
-        "For a library of thousands of massive PDFs, use batch_v14.py on the local/server report folder instead of uploading all 5,000 files through one browser session."
+        "For a library of thousands of massive PDFs, use batch_v15.py on the local/server report folder instead of uploading all 5,000 files through one browser session."
     )
 
 if uploads:
@@ -765,6 +862,34 @@ else:
                         key="semjson_" + r["name"],
                         use_container_width=True,
                     )
+
+                with st.expander("V15 page QA / MDA research data", expanded=False):
+                    qs = r.get("quality_summary", {})
+                    q1, q2, q3 = st.columns(3)
+                    q1.metric("Native", qs.get("NATIVE", 0))
+                    q2.metric("OCR", qs.get("OCR", 0))
+                    q3.metric("Review", qs.get("REVIEW", 0))
+                    st.download_button(
+                        "Page quality manifest CSV",
+                        r.get("quality_manifest_csv", b""),
+                        f"{r['stem']}_page_quality_manifest.csv",
+                        "text/csv",
+                        key="qualitycsv_" + r["name"],
+                        use_container_width=True,
+                    )
+                    mda_files = r.get("mda_exports", {})
+                    if mda_files:
+                        st.caption("MDA boundaries come from the validated V14 section engine; V15 only structures content inside that range.")
+                        for mda_name, mda_data in mda_files.items():
+                            if mda_data:
+                                st.download_button(
+                                    mda_name.replace("_", " ").replace(".csv", ""),
+                                    mda_data,
+                                    mda_name,
+                                    "text/csv",
+                                    key=f"mda_{mda_name}_{r['name']}",
+                                    use_container_width=True,
+                                )
 
                 with st.expander("Search inside this report"):
                     sq = st.text_input("Search term", key="search_" + r["name"])
